@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <meta name="apple-mobile-web-app-title" content="SNL Okey">
@@ -623,7 +623,7 @@
             width: 72px !important;
             padding: 8px 6px !important;
             text-align: center;
-            font-size: 15px !important;
+            font-size: 16px !important;
             font-weight: 700;
             border: 2px solid #e0e0e0 !important;
             border-radius: 8px !important;
@@ -1574,6 +1574,10 @@
             var lastGame = games.slice().sort(function(a,b) { return new Date(b.date) - new Date(a.date); })[0];
             var year = lastGame ? new Date(lastGame.date).getFullYear() : new Date().getFullYear();
 
+            // Pin each game to this season so its scoring rubric can never drift,
+            // even after a sheet re-sync rebuilds archivedSeasons from scratch.
+            games.forEach(function(g) { if (g && !g.season) g.season = currentSeason; });
+
             // Archive current season
             archivedSeasons.push({
                 season: currentSeason,
@@ -1641,8 +1645,8 @@
             row.id = id;
             row.style.cssText = 'display:flex;gap:10px;align-items:center;margin-bottom:10px;';
             row.innerHTML =
-                '<input type="text" placeholder="Player name" style="flex:1;padding:10px;border:2px solid #e0e0e0;border-radius:8px;font-size:15px;" class="import-player-name">' +
-                '<input type="number" placeholder="Score" min="0" style="width:90px;padding:10px;border:2px solid #e0e0e0;border-radius:8px;font-size:15px;" class="import-player-score">' +
+                '<input type="text" placeholder="Player name" style="flex:1;padding:10px;border:2px solid #e0e0e0;border-radius:8px;font-size:16px;" class="import-player-name">' +
+                '<input type="number" placeholder="Score" min="0" style="width:90px;padding:10px;border:2px solid #e0e0e0;border-radius:8px;font-size:16px;" class="import-player-score">' +
                 '<button type="button" onclick="removeImportPlayer(\'' + id + '\')" style="background:#ff4757;color:white;border:none;padding:8px 12px;border-radius:6px;cursor:pointer;font-size:13px;flex-shrink:0;">✕</button>';
             document.getElementById('import-player-rows').appendChild(row);
         }
@@ -2322,7 +2326,7 @@
                     var seasonNum = sid.replace('archived-season-', '');
                     var entry = window._archivedStatsQueue.find(function(e) { return e.sid === 'as' + seasonNum; });
                     if (entry) {
-                        setTimeout(function() { drawArchivedSeasonCharts(entry.sid, entry.playerStats, entry.games); }, 50);
+                        setTimeout(function() { drawArchivedSeasonCharts(entry.sid, entry.playerStats, entry.games, seasonNum); }, 50);
                         el.dataset.chartsDrawn = '1';
                     }
                 }
@@ -2339,10 +2343,13 @@
 
         function buildArchivedHeaderStats(gamesArr, seasonNum) {
             var savedGames = games;
+            var savedYsOverride = _yeniSkorSeasonOverride;
             games = gamesArr;
+            _yeniSkorSeasonOverride = seasonNum;   // score this season by its own rubric
             var stats;
-            try { stats = calculateStats(); } catch(e) { games = savedGames; return '<p style="color:#999;">Error loading stats.</p>'; }
+            try { stats = calculateStats(); } catch(e) { games = savedGames; _yeniSkorSeasonOverride = savedYsOverride; return '<p style="color:#999;">Error loading stats.</p>'; }
             games = savedGames;
+            _yeniSkorSeasonOverride = savedYsOverride;
 
             var sid = 'as' + seasonNum; // unique prefix for this season's element IDs
             var html = '';
@@ -2383,7 +2390,7 @@
 
             // Yeni Skor
             html += '<h4 style="margin:20px 0 10px;color:#333;font-size:15px;">Yeni Skor</h4>';
-            html += '<div style="font-size:12px;color:#999;margin-bottom:10px;">4 pts for 1st, 2 pts for 2nd, 1 pt for 3rd</div>';
+            html += '<div style="font-size:12px;color:#999;margin-bottom:10px;">' + yeniSkorRubricLabel(seasonNum) + '</div>';
             html += '<div class="ranking-table">';
             rank = 1; prev = null;
             stats.yeniSkorRankings.forEach(function(p) {
@@ -2443,18 +2450,18 @@
 
             // Store stats for deferred chart drawing
             if (!window._archivedStatsQueue) window._archivedStatsQueue = [];
-            window._archivedStatsQueue.push({ sid: sid, playerStats: stats.playerStats, games: gamesArr });
+            window._archivedStatsQueue.push({ sid: sid, playerStats: stats.playerStats, games: gamesArr, season: seasonNum });
 
             return html;
         }
 
-        function drawArchivedSeasonCharts(sid, playerStats, gamesArr) {
+        function drawArchivedSeasonCharts(sid, playerStats, gamesArr, seasonNum) {
             // Radar
             drawRadarChartForId(sid + '-radar-chart', playerStats);
             // Tp chart
             drawArchivedLineChart(sid + '-tp-chart', sid + '-tp-legend', gamesArr, 'totalPoints');
             // Ys chart
-            drawArchivedLineChart(sid + '-ys-chart', sid + '-ys-legend', gamesArr, 'yeniSkor');
+            drawArchivedLineChart(sid + '-ys-chart', sid + '-ys-legend', gamesArr, 'yeniSkor', seasonNum);
         }
 
         function drawRadarChartForId(svgId, playerStats) {
@@ -2465,9 +2472,9 @@
             }).sort(function(a,b){return a.name.localeCompare(b.name);});
             if (players.length === 0) return;
             var cx=190,cy=175,maxR=130,levels=4,n=players.length;
-            var maxVal=3,minVal=0;
+            var maxVal=1,minVal=0;   // outer ring = 1.0 avg score
             function angle(i){return (i/n)*2*Math.PI-Math.PI/2;}
-            function scaleR(val){return ((val-minVal)/(maxVal-minVal))*maxR;}
+            function scaleR(val){var r=((val-minVal)/(maxVal-minVal))*maxR;return r<0?0:(r>maxR?maxR:r);}
             function pt(i,r){var a=angle(i);return{x:cx+r*Math.cos(a),y:cy+r*Math.sin(a)};}
             var svgHTML='';
             for(var l=1;l<=levels;l++){var r=(l/levels)*maxR;var pts=players.map(function(_,i){return pt(i,r);});var d=pts.map(function(p,i){return(i===0?'M':'L')+p.x.toFixed(1)+','+p.y.toFixed(1);}).join(' ')+' Z';svgHTML+='<path d="'+d+'" fill="none" stroke="#dde8e1" stroke-width="1"/>';}
@@ -2485,7 +2492,7 @@
             svg.innerHTML = svgHTML;
         }
 
-        function drawArchivedLineChart(canvasId, legendId, gamesArr, metric) {
+        function drawArchivedLineChart(canvasId, legendId, gamesArr, metric, seasonNum) {
             var canvas = document.getElementById(canvasId);
             var legendEl = document.getElementById(legendId);
             if (!canvas || !gamesArr || !gamesArr.length) return;
@@ -2510,7 +2517,7 @@
                 } else {
                     var sorted=Object.entries(gameTotals).sort(function(a,b){return b[1]-a[1];});
                     var rank=1,prevScore=null;
-                    sorted.forEach(function(e){if(prevScore!==null&&e[1]<prevScore)rank++;prevScore=e[1];var pts=rank===1?4:rank===2?2:rank===3?1:0;yeniCum[e[0]]=(yeniCum[e[0]]||0)+pts;});
+                    sorted.forEach(function(e){if(prevScore!==null&&e[1]<prevScore)rank++;prevScore=e[1];var pts=yeniSkorPoints(game.season||seasonNum, rank);yeniCum[e[0]]=(yeniCum[e[0]]||0)+pts;});
                     playerNames.forEach(function(p,i){datasets[i].data.push(yeniCum[p]||0);});
                 }
             });
@@ -2642,7 +2649,7 @@
                 html += '</div>';
 
                 // Yeni Skor Rankings
-                html += '<h3 style="margin: 24px 0 16px 0; color: #333; font-size: 16px;">Yeni Skor</h3><div style="font-size:12px;color:#999;margin-bottom:12px;">4 pts for 1st, 2 pts for 2nd, 1 pt for 3rd</div><div class="ranking-table">';
+                html += '<h3 style="margin: 24px 0 16px 0; color: #333; font-size: 16px;">Yeni Skor</h3><div style="font-size:12px;color:#999;margin-bottom:12px;">' + yeniSkorRubricLabel(currentSeason) + '</div><div class="ranking-table">';
                 currentRank = 1;
                 prevScore = null;
                 stats.yeniSkorRankings.forEach(function(player, index) {
@@ -2774,10 +2781,11 @@
                 if (p.avgScoreNotDistributor !== null) allScores.push(p.avgScoreNotDistributor);
             });
             var minVal = 0;
-            var maxVal = 3;
+            var maxVal = 1;   // outer ring = 1.0 avg score
+                             // (real values top out near 0.6; raise this if that changes)
 
             function angle(i) { return (i / n) * 2 * Math.PI - Math.PI / 2; }
-            function scaleR(val) { return ((val - minVal) / (maxVal - minVal)) * maxR; }
+            function scaleR(val) { var r = ((val - minVal) / (maxVal - minVal)) * maxR; return r < 0 ? 0 : (r > maxR ? maxR : r); }
             function pt(i, r) { var a = angle(i); return { x: cx + r * Math.cos(a), y: cy + r * Math.sin(a) }; }
 
             var svgHTML = '';
@@ -2788,7 +2796,8 @@
                 var pts = players.map(function(_, i) { return pt(i, r); });
                 var d = pts.map(function(p, i) { return (i === 0 ? 'M' : 'L') + p.x.toFixed(1) + ',' + p.y.toFixed(1); }).join(' ') + ' Z';
                 svgHTML += '<path d="' + d + '" fill="none" stroke="#dde8e1" stroke-width="1"/>';
-                var labelVal = Math.round((l / levels) * maxVal);
+                var lvRaw = (l / levels) * maxVal;
+                var labelVal = parseFloat(lvRaw.toFixed(2)).toString();   // 0.25 / 0.5 / 0.75 / 1
                 var lp = pt(0, r);
                 svgHTML += '<text x="' + (lp.x + 4).toFixed(1) + '" y="' + (lp.y - 3).toFixed(1) + '" font-size="8" fill="#bbb" font-family="monospace">' + labelVal + '</text>';
             }
@@ -3025,6 +3034,48 @@
             return html;
         }
 
+        // ===== Yeni Skor rubric history =====
+        // Points by finishing position [1st, 2nd, 3rd, 4th], keyed to the season a game
+        // was played in. A season's rubric is pinned to that season permanently, so
+        // archived seasons are never re-scored when the rules change.
+        //
+        // TO CHANGE SCORING LATER: add ONE new entry whose fromSeason is the first
+        // season the new rules apply to. Never edit an existing entry - that would
+        // rewrite the history of seasons already played.
+        var YENI_SKOR_RUBRICS = [
+            { fromSeason: 1, points: [4, 2, 1, 0] },   // Seasons 1-2
+            { fromSeason: 3, points: [5, 2, 1, 0] }    // Season 3 onward
+        ];
+
+        // Set while stats are being computed for one specific (archived) season.
+        var _yeniSkorSeasonOverride = null;
+
+        function yeniSkorRubricFor(season) {
+            var s = parseInt(season, 10);
+            if (!s || s < 1) s = 1;
+            var chosen = YENI_SKOR_RUBRICS[0];
+            for (var i = 0; i < YENI_SKOR_RUBRICS.length; i++) {
+                if (s >= YENI_SKOR_RUBRICS[i].fromSeason) chosen = YENI_SKOR_RUBRICS[i];
+            }
+            return chosen.points;
+        }
+
+        function yeniSkorPoints(season, rank) {
+            var pts = yeniSkorRubricFor(season);
+            return (rank >= 1 && rank <= pts.length) ? pts[rank - 1] : 0;
+        }
+
+        function yeniSkorRubricLabel(season) {
+            var p = yeniSkorRubricFor(season);
+            return p[0] + ' pts for 1st, ' + p[1] + ' pts for 2nd, ' + p[2] + ' pt for 3rd';
+        }
+
+        function seasonOfGame(game) {
+            if (game && game.season) return game.season;
+            if (_yeniSkorSeasonOverride) return _yeniSkorSeasonOverride;
+            return currentSeason;
+        }
+
         function calculateStats() {
             const playerMap = new Map();
             let totalRounds = 0;
@@ -3068,9 +3119,10 @@
                             stats.gameTotals.push(score);
                             if (previousScore !== null && score < previousScore) currentRank++;
                             previousScore = score;
-                            if (currentRank === 1) { stats.firstPlace++; stats.yeniSkor += 4; }
-                            else if (currentRank === 2) { stats.secondPlace++; stats.yeniSkor += 2; }
-                            else if (currentRank === 3) { stats.thirdPlace++; stats.yeniSkor += 1; }
+                            stats.yeniSkor += yeniSkorPoints(seasonOfGame(game), currentRank);
+                            if (currentRank === 1) { stats.firstPlace++; }
+                            else if (currentRank === 2) { stats.secondPlace++; }
+                            else if (currentRank === 3) { stats.thirdPlace++; }
                             else if (currentRank === 4) { stats.fourthPlace++; }
                         });
                     }
@@ -3157,9 +3209,10 @@
                         stats.gameTotals.push(score);
                         if (previousScore !== null && score < previousScore) currentRank++;
                         previousScore = score;
-                        if (currentRank === 1) { stats.firstPlace++; stats.yeniSkor += 4; }
-                        else if (currentRank === 2) { stats.secondPlace++; stats.yeniSkor += 2; }
-                        else if (currentRank === 3) { stats.thirdPlace++; stats.yeniSkor += 1; }
+                        stats.yeniSkor += yeniSkorPoints(seasonOfGame(game), currentRank);
+                        if (currentRank === 1) { stats.firstPlace++; }
+                        else if (currentRank === 2) { stats.secondPlace++; }
+                        else if (currentRank === 3) { stats.thirdPlace++; }
                         else if (currentRank === 4) { stats.fourthPlace++; }
                     });
                 }
@@ -3697,9 +3750,7 @@
                 sorted.forEach(function(name, idx) {
                     if (prevScore !== null && gameTotals[name] < prevScore) rank = idx + 1;
                     prevScore = gameTotals[name];
-                    if (rank === 1) gameYs[name] = 5;
-                    else if (rank === 2) gameYs[name] = 2;
-                    else if (rank === 3) gameYs[name] = 1;
+                    gameYs[name] = yeniSkorPoints(seasonOfGame(game), rank);
                 });
                 playerNames.forEach(function(n) {
                     var prev = cumulative[n].length ? cumulative[n][cumulative[n].length - 1] : 0;
