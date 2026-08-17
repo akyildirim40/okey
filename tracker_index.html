@@ -1554,21 +1554,9 @@
             if (!confirm('End Season ' + currentSeason + ' and start Season ' + (currentSeason + 1) + '?\n\nAll current stats and history will be archived under Season ' + currentSeason + '.')) return;
             if (!confirm('Are you sure? This cannot be undone.')) return;
 
-            // Calculate season winner (most total points)
-            var playerTotals = {};
-            games.forEach(function(game) {
-                if (!game.rounds) return;
-                game.rounds.forEach(function(round) {
-                    if (!round.scores) return;
-                    round.scores.forEach(function(sd) {
-                        playerTotals[sd.player] = (playerTotals[sd.player] || 0) + (sd.score || 0);
-                    });
-                });
-            });
-            var winner = null, winnerScore = -1;
-            Object.keys(playerTotals).forEach(function(p) {
-                if (playerTotals[p] > winnerScore) { winner = p; winnerScore = playerTotals[p]; }
-            });
+            // Season champion = highest Yeni Skor (Toplam Puan breaks ties)
+            var _sw = seasonWinnerFromGames(games, currentSeason);
+            var winner = _sw.winner, winnerScore = _sw.winnerScore;
 
             // Determine year from last game
             var lastGame = games.slice().sort(function(a,b) { return new Date(b.date) - new Date(a.date); })[0];
@@ -1619,7 +1607,7 @@
             document.getElementById('setup-view').style.display = 'none';
             document.getElementById('no-game-view').style.display = 'block';
 
-            alert('🏆 Season archived! Season ' + (currentSeason - 1) + ' winner: ' + winner + ' (' + winnerScore + ' pts)\n\nSeason ' + currentSeason + ' has begun!');
+            alert('🏆 Season archived! Season ' + (currentSeason - 1) + ' winner: ' + winner + ' (' + winnerScore + ' Yeni Skor)\n\nSeason ' + currentSeason + ' has begun!');
             switchTab('stats');
         }
 
@@ -1809,16 +1797,8 @@
                     for (var s = 1; s < maxSheetSeason; s++) {
                         var seasonGamesArr = parsed.filter(function(g) { return (g.season||1) === s; });
                         if (seasonGamesArr.length === 0) continue;
-                        var playerTotals = {};
-                        seasonGamesArr.forEach(function(game) {
-                            game.rounds.forEach(function(round) {
-                                round.scores.forEach(function(sd) {
-                                    playerTotals[sd.player] = (playerTotals[sd.player]||0) + (sd.score||0);
-                                });
-                            });
-                        });
-                        var winner = null, winnerScore = -1;
-                        Object.keys(playerTotals).forEach(function(p) { if (playerTotals[p] > winnerScore) { winner = p; winnerScore = playerTotals[p]; } });
+                        var _sw = seasonWinnerFromGames(seasonGamesArr, s);
+                        var winner = _sw.winner, winnerScore = _sw.winnerScore;
                         var lastGame = seasonGamesArr.slice().sort(function(a,b){return new Date(b.date)-new Date(a.date);})[0];
                         var year = lastGame ? new Date(lastGame.date).getFullYear() : new Date().getFullYear();
                         archivedSeasons.push({ season: s, year: year, games: seasonGamesArr, winner: winner, winnerScore: winnerScore });
@@ -3074,6 +3054,48 @@
             if (game && game.season) return game.season;
             if (_yeniSkorSeasonOverride) return _yeniSkorSeasonOverride;
             return currentSeason;
+        }
+
+        // ===== Season champion =====
+        // The champion of a season is the player with the highest YENI SKOR, scored under
+        // that season's own rubric. Toplam Puan (raw cumulative score) breaks ties.
+        // Runs the same calculateStats() the Yeni Skor table uses, so the crowned player
+        // always matches the top of that table. Falls back to Toplam Puan if stats fail.
+        function seasonWinnerFromGames(gamesArr, seasonNum) {
+            var savedGames = games, savedOverride = _yeniSkorSeasonOverride;
+            var res = { winner: null, winnerScore: -1, totalPoints: -1, tied: false };
+            try {
+                games = gamesArr;
+                _yeniSkorSeasonOverride = seasonNum;
+                var ranked = calculateStats().playerStats.slice().sort(function(a, b) {
+                    if (b.yeniSkor !== a.yeniSkor) return b.yeniSkor - a.yeniSkor;
+                    return b.totalPoints - a.totalPoints;
+                });
+                if (ranked.length) {
+                    res.winner = ranked[0].name;
+                    res.winnerScore = ranked[0].yeniSkor;
+                    res.totalPoints = ranked[0].totalPoints;
+                    res.tied = ranked.length > 1 &&
+                               ranked[1].yeniSkor === ranked[0].yeniSkor &&
+                               ranked[1].totalPoints === ranked[0].totalPoints;
+                }
+            } catch (e) {
+                var totals = {};
+                (gamesArr || []).forEach(function(g) {
+                    ((g && g.rounds) || []).forEach(function(r) {
+                        ((r && r.scores) || []).forEach(function(sd) {
+                            totals[sd.player] = (totals[sd.player] || 0) + (sd.score || 0);
+                        });
+                    });
+                });
+                Object.keys(totals).forEach(function(p) {
+                    if (totals[p] > res.totalPoints) { res.winner = p; res.totalPoints = totals[p]; }
+                });
+            } finally {
+                games = savedGames;
+                _yeniSkorSeasonOverride = savedOverride;
+            }
+            return res;
         }
 
         function calculateStats() {

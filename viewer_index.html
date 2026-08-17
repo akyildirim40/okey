@@ -570,6 +570,48 @@
         return maxSeason;
     }
 
+    // ===== Season champion =====
+    // The champion of a season is the player with the highest YENI SKOR, scored under
+    // that season's own rubric. Toplam Puan (raw cumulative score) breaks ties.
+    // Runs the same calculateStats() the Yeni Skor table uses, so the crowned player
+    // always matches the top of that table. Falls back to Toplam Puan if stats fail.
+    function seasonWinnerFromGames(gamesArr, seasonNum) {
+        var savedGames = games, savedOverride = _yeniSkorSeasonOverride;
+        var res = { winner: null, winnerScore: -1, totalPoints: -1, tied: false };
+        try {
+            games = gamesArr;
+            _yeniSkorSeasonOverride = seasonNum;
+            var ranked = calculateStats().playerStats.slice().sort(function(a, b) {
+                if (b.yeniSkor !== a.yeniSkor) return b.yeniSkor - a.yeniSkor;
+                return b.totalPoints - a.totalPoints;
+            });
+            if (ranked.length) {
+                res.winner = ranked[0].name;
+                res.winnerScore = ranked[0].yeniSkor;
+                res.totalPoints = ranked[0].totalPoints;
+                res.tied = ranked.length > 1 &&
+                           ranked[1].yeniSkor === ranked[0].yeniSkor &&
+                           ranked[1].totalPoints === ranked[0].totalPoints;
+            }
+        } catch (e) {
+            var totals = {};
+            (gamesArr || []).forEach(function(g) {
+                ((g && g.rounds) || []).forEach(function(r) {
+                    ((r && r.scores) || []).forEach(function(sd) {
+                        totals[sd.player] = (totals[sd.player] || 0) + (sd.score || 0);
+                    });
+                });
+            });
+            Object.keys(totals).forEach(function(p) {
+                if (totals[p] > res.totalPoints) { res.winner = p; res.totalPoints = totals[p]; }
+            });
+        } finally {
+            games = savedGames;
+            _yeniSkorSeasonOverride = savedOverride;
+        }
+        return res;
+    }
+
     function calculateStats() {
         var playerMap = new Map();
         var totalRounds = 0;
@@ -840,17 +882,9 @@
 
 
     function buildViewerArchivedSeasonHeaderHTML(seasonNum, gamesArr, idPrefix) {
-        var winner = null, winnerScore = -1, playerTotals = {};
-        gamesArr.forEach(function(game) {
-            game.rounds.forEach(function(round) {
-                round.scores.forEach(function(sd) {
-                    playerTotals[sd.player] = (playerTotals[sd.player] || 0) + (sd.score || 0);
-                });
-            });
-        });
-        Object.keys(playerTotals).forEach(function(p) {
-            if (playerTotals[p] > winnerScore) { winner = p; winnerScore = playerTotals[p]; }
-        });
+        // Season champion = highest Yeni Skor (Toplam Puan breaks ties)
+        var _sw = seasonWinnerFromGames(gamesArr, seasonNum);
+        var winner = _sw.winner, winnerScore = _sw.winnerScore;
 
         var year = '';
         if (gamesArr.length > 0) {
