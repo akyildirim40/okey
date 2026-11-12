@@ -327,7 +327,15 @@
                 if (csvText.length < 20) {
                     throw new Error('Sheet appears empty or not properly published.');
                 }
-                games = parseCSV(csvText);
+                var previousGames = games;
+                var previousSeasonGames = seasonGames;
+                var previousMaxSeason = maxSeason;
+                var parsedGames = parseCSV(csvText);
+                if (!parsedGames.length && previousGames.length) {
+                    seasonGames = previousSeasonGames; maxSeason = previousMaxSeason;
+                    throw new Error('No valid game rows were found. Existing display was not replaced.');
+                }
+                games = parsedGames;
                 console.log('Parsed games:', games.length);
                 document.getElementById('last-updated').textContent = 'Last updated: ' + new Date().toLocaleTimeString('en-US', { timeZone: 'America/Chicago' });
                 renderStats();
@@ -351,180 +359,91 @@
     }
 
     function parseCSV(csvText) {
-        var lines = csvText.trim().split('\n');
-        console.log('Total CSV lines:', lines.length);
-        if (lines.length < 2) return [];
-
-        // Helper function to parse CSV line properly (handles quoted fields)
-        function parseCSVLine(line) {
-            var result = [];
-            var current = '';
-            var inQuotes = false;
-            
-            for (var i = 0; i < line.length; i++) {
-                var char = line[i];
-                
-                if (char === '"') {
-                    inQuotes = !inQuotes;
-                } else if (char === ',' && !inQuotes) {
-                    result.push(current);
-                    current = '';
-                } else {
-                    current += char;
-                }
+        function csvRecords(text) {
+            var rows = [], row = [], cell = '', quoted = false;
+            text = String(text || '').replace(/^\uFEFF/, '');
+            for (var i = 0; i < text.length; i++) {
+                var ch = text[i], next = text[i + 1];
+                if (ch === '"' && quoted && next === '"') { cell += '"'; i++; }
+                else if (ch === '"') { quoted = !quoted; }
+                else if (ch === ',' && !quoted) { row.push(cell); cell = ''; }
+                else if ((ch === '\n' || ch === '\r') && !quoted) {
+                    if (ch === '\r' && next === '\n') i++;
+                    row.push(cell); cell = '';
+                    if (row.some(function(x){return String(x).trim() !== '';})) rows.push(row);
+                    row = [];
+                } else cell += ch;
             }
-            result.push(current);
-            return result;
+            row.push(cell);
+            if (row.some(function(x){return String(x).trim() !== '';})) rows.push(row);
+            return rows;
         }
-
-        var gameMap = new Map();
-        var configuredMaxSeason = 0;
-        for (var i = 1; i < lines.length; i++) {
-            var line = lines[i].trim();
-            if (!line) continue;
-            
-            var cols = parseCSVLine(line);
-            console.log('Row ' + i + ' columns:', cols.length, cols);
-            
-            // Google Forms puts timestamp in column 0
-            // Check if this is old format (7 data fields) or new format (8 data fields)
-            var hasGameId = cols.length >= 9; // timestamp + 8 fields
-            
-            if (cols.length < 6) {
-                console.log('Skipping row with insufficient columns:', cols);
-                continue;
-            }
-
-            var gameId, date, roundNumber, playerName, score, distributor, leftNeighbor, rightNeighbor;
-            var col7IsSeasonNum = false; // used for auto-detecting season vs neighbor column order
-            var col7v = '', col8v = '', col9v = '';
-
+        function norm(v) { return String(v || '').toLowerCase().replace(/[^a-z0-9]/g, ''); }
+        function col(headers, names, fallback) {
+            for (var i=0;i<names.length;i++) { var n=headers.indexOf(names[i]); if(n>=0)return n; }
+            return fallback;
+        }
+        var records = csvRecords(csvText);
+        console.log('Total CSV records:', records.length);
+        if (records.length < 2) return [];
+        var headers = records[0].map(norm);
+        var headerHasId = headers.indexOf('gameid') >= 0 || headers.indexOf('gameidentifier') >= 0;
+        var hasGameId = headerHasId || records[1].length >= 10;
+        var ix = headerHasId ? {
+            id:col(headers,['gameid','gameidentifier'],1), date:col(headers,['date','gamedate'],2), round:col(headers,['round','roundnumber'],3),
+            player:col(headers,['player','playername'],4), score:col(headers,['score','points'],5), distributor:col(headers,['distributor','isdistributor'],6),
+            left:col(headers,['left','leftneighbor'],7), right:col(headers,['right','rightneighbor'],8), season:col(headers,['season','seasonnumber'],9)
+        } : {id:1,date:2,round:3,player:4,score:5,distributor:6,left:7,right:8,season:9};
+        var gameMap = new Map(), configuredMaxSeason = 0, uniqueRows = new Map();
+        for (var i=1;i<records.length;i++) {
+            var cols = records[i].map(function(x){return String(x == null ? '' : x).trim();});
+            if (cols.length < 6) continue;
+            var gameId,date,roundNumber,playerName,score,distributor,leftNeighbor,rightNeighbor,season=1;
             if (hasGameId) {
-                // NEW FORMAT: timestamp, gameId, date, round, player, score, distributor, left, right, season
-                // OR:         timestamp, gameId, date, round, player, score, distributor, season, left, right
-                gameId = cols[1].trim();
-
-                // SEASON_CONFIG row — just read the season number and skip
-                if (gameId === 'SEASON_CONFIG') {
-                    var cfgSeason = cols[9] ? parseInt(cols[9].trim()) : NaN;
-                    if (!isNaN(cfgSeason) && cfgSeason > 0) configuredMaxSeason = Math.max(configuredMaxSeason, cfgSeason);
+                gameId=cols[ix.id]||''; date=cols[ix.date]||''; roundNumber=parseInt(cols[ix.round],10);
+                playerName=cols[ix.player]||''; score=Number(cols[ix.score]); distributor=parseDistributor(cols[ix.distributor]);
+                leftNeighbor=cols[ix.left]||''; rightNeighbor=cols[ix.right]||'';
+                var seasonRaw=cols[ix.season]||'';
+                if (!headerHasId && (!/^\d+$/.test(seasonRaw)) && /^\d+$/.test(cols[7]||'') && Number(cols[7])>0) {
+                    seasonRaw=cols[7]; leftNeighbor=cols[8]||''; rightNeighbor=cols[9]||'';
+                }
+                var ps=parseInt(seasonRaw,10); if(ps>0)season=ps;
+                if (gameId==='SEASON_CONFIG' || playerName==='SEASON_CONFIG') {
+                    configuredMaxSeason=Math.max(configuredMaxSeason,parseInt(seasonRaw||cols[5],10)||0);
                     continue;
                 }
-
-                date = cols[2].trim();
-                roundNumber = parseInt(cols[3].trim());
-                playerName = cols[4].trim();
-                score = parseInt(cols[5].trim());
-                distributor = parseDistributor(cols[6]);
-                col7v = cols[7] ? cols[7].trim() : '';
-                col8v = cols[8] ? cols[8].trim() : '';
-                col9v = cols[9] ? cols[9].trim() : '';
-                // Auto-detect: if col[7] is a small integer it's the season number, neighbors are at col[8] and col[9]
-                col7IsSeasonNum = !!col7v && /^\d+$/.test(col7v) && parseInt(col7v) >= 1 && parseInt(col7v) <= 999;
-                if (col7IsSeasonNum) {
-                    leftNeighbor = col8v;
-                    rightNeighbor = col9v;
-                } else {
-                    leftNeighbor = col7v;
-                    rightNeighbor = col8v;
-                }
             } else {
-                // OLD FORMAT: timestamp, date, round, player, score, distributor, left, right
-                // Generate a fake game ID based on date
-                date = cols[1].trim();
-                roundNumber = parseInt(cols[2].trim());
-                playerName = cols[3].trim();
-                score = parseInt(cols[4].trim());
-                distributor = parseDistributor(cols[5]);
-                leftNeighbor = cols[6] ? cols[6].trim() : '';
-                rightNeighbor = cols[7] ? cols[7].trim() : '';
-                
-                // For old format, detect game boundaries by round number resets
-                var gamesForDate = [];
-                gameMap.forEach(function(g, key) {
-                    if (g.date === date) {
-                        gamesForDate.push({ key: key, game: g });
-                    }
-                });
-                
-                if (gamesForDate.length === 0) {
-                    gameId = date + '_1';
-                } else {
-                    var lastGame = gamesForDate[gamesForDate.length - 1];
-                    var maxRoundInLastGame = 0;
-                    lastGame.game.rounds.forEach(function(round) {
-                        if (round.roundNumber > maxRoundInLastGame) {
-                            maxRoundInLastGame = round.roundNumber;
-                        }
-                    });
-                    
-                    if (roundNumber === 1 && maxRoundInLastGame > 1) {
-                        gameId = date + '_' + (gamesForDate.length + 1);
-                    } else {
-                        gameId = lastGame.key;
-                    }
+                date=cols[1]||''; roundNumber=parseInt(cols[2],10); playerName=cols[3]||''; score=Number(cols[4]);
+                distributor=parseDistributor(cols[5]); leftNeighbor=cols[6]||''; rightNeighbor=cols[7]||'';
+                var forDate=[]; gameMap.forEach(function(g,k){if(g.date===date)forDate.push({key:k,game:g});});
+                if(!forDate.length)gameId=date+'_1';
+                else {
+                    var last=forDate[forDate.length-1], maxRound=0;
+                    last.game.rounds.forEach(function(rr){maxRound=Math.max(maxRound,rr.roundNumber);});
+                    gameId=roundNumber===1&&maxRound>1?date+'_'+(forDate.length+1):last.game.id;
                 }
             }
-            
-            if (!date || isNaN(roundNumber) || !playerName || isNaN(score)) {
-                console.log('Invalid data in row:', { gameId: gameId, date: date, roundNumber: roundNumber, playerName: playerName, score: score });
-                continue;
-            }
-
-            // Use Game ID directly
-            if (!gameMap.has(gameId)) {
-                gameMap.set(gameId, { id: gameId, date: date, rounds: new Map() });
-            }
-            var game = gameMap.get(gameId);
-            if (!game.rounds.has(roundNumber)) {
-                game.rounds.set(roundNumber, { roundNumber: roundNumber, scores: [] });
-            }
-            // Parse season (auto-detected: col[7] if it's a number, otherwise col[9])
-            var season = 1;
-            if (hasGameId) {
-                var seasonStr = col7IsSeasonNum ? col7v : col9v;
-                var parsedSeason = parseInt(seasonStr);
-                if (!isNaN(parsedSeason) && parsedSeason > 0) season = parsedSeason;
-            }
-
-            game.rounds.get(roundNumber).scores.push({
-                player: playerName, score: score, distributor: distributor,
-                leftNeighbor: leftNeighbor, rightNeighbor: rightNeighbor
-            });
-
-            // Track season per game (use the last seen season for that gameId)
-            game.season = season;
+            if(!gameId||!date||!Number.isInteger(roundNumber)||roundNumber<1||!playerName||!Number.isFinite(score)) continue;
+            uniqueRows.set(season+'|'+gameId+'|'+roundNumber+'|'+playerName.toLowerCase(), {gameId:gameId,date:date,round:roundNumber,player:playerName,score:score,
+                distributor:distributor,left:leftNeighbor,right:rightNeighbor,season:season});
         }
-
-        var result = [];
-        gameMap.forEach(function(game) {
-            var rounds = [];
-            game.rounds.forEach(function(round) { rounds.push(round); });
-            rounds.sort(function(a, b) { return a.roundNumber - b.roundNumber; });
-            result.push({ id: game.id, date: game.date, rounds: rounds, season: game.season || 1 });
+        uniqueRows.forEach(function(rec){
+            var gameKey=String(rec.season||1)+'|'+rec.gameId;
+            if(!gameMap.has(gameKey))gameMap.set(gameKey,{id:rec.gameId,date:rec.date,rounds:new Map(),season:rec.season});
+            var game=gameMap.get(gameKey); game.season=rec.season||game.season||1;
+            if(!game.rounds.has(rec.round))game.rounds.set(rec.round,{roundNumber:rec.round,scores:[]});
+            game.rounds.get(rec.round).scores.push({player:rec.player,score:rec.score,distributor:rec.distributor,leftNeighbor:rec.left,rightNeighbor:rec.right});
         });
-        result.sort(function(a, b) { return new Date(b.date) - new Date(a.date); });
-
-        // Build seasonGames map
-        seasonGames = {};
-        maxSeason = 1;
-        result.forEach(function(game) {
-            var s = game.season || 1;
-            if (!seasonGames[s]) seasonGames[s] = [];
-            seasonGames[s].push(game);
-            if (s > maxSeason) maxSeason = s;
+        var result=[];
+        gameMap.forEach(function(game){
+            var rounds=Array.from(game.rounds.values()).sort(function(a,b){return a.roundNumber-b.roundNumber;});
+            result.push({id:game.id,date:game.date,rounds:rounds,season:game.season||1});
         });
-
-        // If a SEASON_CONFIG row declared a higher season, trust it
-        // (this allows the viewer to show past seasons as archived even before
-        //  any round has been submitted for the new season)
-        if (configuredMaxSeason > maxSeason) {
-            maxSeason = configuredMaxSeason;
-            // Ensure the current season bucket exists (may be empty)
-            if (!seasonGames[maxSeason]) seasonGames[maxSeason] = [];
-        }
-        
-        console.log('Parsed ' + result.length + ' games across seasons:', Object.keys(seasonGames));
+        result.sort(function(a,b){return new Date(b.date)-new Date(a.date);});
+        seasonGames={}; maxSeason=Math.max(1,configuredMaxSeason);
+        result.forEach(function(game){var s=game.season||1;if(!seasonGames[s])seasonGames[s]=[];seasonGames[s].push(game);if(s>maxSeason)maxSeason=s;});
+        if(!seasonGames[maxSeason])seasonGames[maxSeason]=[];
+        console.log('Parsed '+result.length+' games across seasons:',Object.keys(seasonGames));
         return result;
     }
 
@@ -612,19 +531,29 @@
         return res;
     }
 
+    function isDistributorValue(value) {
+        if (value === true || value === 1) return true;
+        var normalized = String(value == null ? '' : value).trim().toLowerCase();
+        return normalized === '1' || normalized === '1.0' || normalized === 'true' || normalized === 'yes';
+    }
+
     function calculateStats() {
         var playerMap = new Map();
         var totalRounds = 0;
 
+        if (!games || !Array.isArray(games)) return { totalRounds: 0, playerStats: [], rankings: [], yeniSkorRankings: [] };
+
         games.forEach(function(game) {
+            if (!game || !Array.isArray(game.rounds)) return;
             var gamePlayerTotals = new Map();
 
             game.rounds.forEach(function(round) {
+                if (!round || !Array.isArray(round.scores)) return;
                 totalRounds++;
 
                 // Determine if this round has distributor data:
                 // at least one player must explicitly have distributor === true
-                var roundHasDistributor = round.scores.some(function(sd) { return sd.distributor === true; });
+                var roundHasDistributor = round.scores.some(function(sd) { return isDistributorValue(sd.distributor); });
 
                 round.scores.forEach(function(scoreData) {
                     if (!scoreData.player) return;
@@ -650,7 +579,7 @@
 
                     // Only accumulate distributor stats if this round has distributor data
                     if (roundHasDistributor) {
-                        if (scoreData.distributor === true) {
+                        if (isDistributorValue(scoreData.distributor)) {
                             stats.distScoreTotal += s;
                             stats.distRounds++;
                         } else {

@@ -1167,7 +1167,7 @@
             <!-- History Tab -->
             <div id="history-tab" class="tab-content">
                 <div style="background: #e7f3ff; border: 1px solid #b3d9ff; padding: 12px; border-radius: 8px; margin-bottom: 16px; font-size: 13px; color: #004085;">
-                    ⚡ <strong>Auto-Sync Enabled:</strong> All rounds are automatically synced to Google Sheets in real-time. Your friends can view live stats using the viewer app!
+                    ⚡ <strong>Google Sheets submissions:</strong> Each saved round is submitted to Google Sheets. The browser cannot verify the Apps Script response, so use the Settings refresh button to confirm that the rows arrived.
                 </div>
                 <button class="btn btn-success" onclick="exportToCSV()">📥 Export to CSV (Backup)</button>
                 <button class="btn btn-primary" onclick="copyDataToClipboard()" style="margin-top: 8px;">📋 Copy All Data (Transfer to Another Device)</button>
@@ -1279,6 +1279,8 @@
                     <input type="url" id="sheet-url" placeholder="https://docs.google.com/spreadsheets/d/..." value="">
                     <small style="color: #666; font-size: 12px; display: block; margin-top: 4px;">Share this URL with friends so they can view stats</small>
                 </div>
+                <button type="button" class="btn btn-secondary" id="refresh-sheet-btn" onclick="refreshStatsFromSheet()">↻ Refresh Tracker from Google Sheets</button>
+                <div id="sheet-refresh-status" style="font-size:12px;color:#666;margin-top:8px;min-height:18px;">Refresh imports the Sheet's current rows into this device. Sheet data is not changed.</div>
 
                 <h4 style="margin: 24px 0 8px 0; color: #333; font-size: 15px;">&#9999;&#65039; Edit Rounds (Apps Script):</h4>
                 <div style="background: #e7f3ff; border-left: 4px solid #4a7c2c; padding: 12px; border-radius: 6px; margin-bottom: 16px; font-size: 13px; color: #333;">
@@ -1378,6 +1380,7 @@
                             currentGame = null;
                             localStorage.removeItem('currentGame');
                         } else {
+                            if (!currentGame.season) currentGame.season = currentSeason;
                             // Ensure playerNames exists (for backwards compatibility)
                             if (!currentGame.playerNames) {
                                 currentGame.playerNames = currentGame.seatingOrder.slice();
@@ -1441,6 +1444,107 @@
                 console.error('Error saving data:', error);
                 alert('Error saving data. Please check your browser storage.');
             }
+        }
+
+        // Resolve the configured Sheet URL to a CSV endpoint. This same reader is
+        // used for manual refreshes and post-write verification.
+        function normalizedSheetCsvUrl(url) {
+            if (!url) throw new Error('Google Sheet URL is not configured.');
+            if (url.includes('/pubhtml')) url = url.replace('/pubhtml', '/pub?output=csv');
+            var published = url.match(/\/spreadsheets\/d\/e\/([a-zA-Z0-9-_]+)/);
+            if (published) return 'https://docs.google.com/spreadsheets/d/e/' + published[1] + '/pub?output=csv';
+            var regular = url.match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
+            if (regular && !url.includes('/pub?') && !url.includes('/export?')) {
+                return 'https://docs.google.com/spreadsheets/d/' + regular[1] + '/export?format=csv&gid=0';
+            }
+            return url;
+        }
+
+        function fetchSheetCsvText(url) {
+            var baseUrl = normalizedSheetCsvUrl(url || sheetUrl);
+            var freshUrl = baseUrl + (baseUrl.indexOf('?') >= 0 ? '&' : '?') + '_=' + Date.now() + '_' + Math.random().toString(36).slice(2);
+            var corsProxy = 'https://corsproxy.io/?' + encodeURIComponent(freshUrl);
+            var allOriginsProxy = 'https://api.allorigins.win/raw?url=' + encodeURIComponent(freshUrl);
+            return fetch(freshUrl, { cache: 'no-store' })
+                .then(function(r) { if (!r.ok) throw new Error('Direct Sheet read returned HTTP ' + r.status); return r.text(); })
+                .catch(function() {
+                    return fetch(corsProxy, { cache: 'no-store' })
+                        .then(function(r) { if (!r.ok) throw new Error('CORS proxy returned HTTP ' + r.status); return r.text(); });
+                })
+                .catch(function() {
+                    return fetch(allOriginsProxy, { cache: 'no-store' })
+                        .then(function(r) { if (!r.ok) throw new Error('Backup Sheet reader returned HTTP ' + r.status); return r.text(); });
+                })
+                .then(function(csv) {
+                    if (!csv || csv.length < 10) throw new Error('Google Sheets returned an empty or incomplete CSV.');
+                    return csv;
+                });
+        }
+
+        function sheetContainsPayload(payload, csvText) {
+            var parsed = parseCSVIntoGames(csvText);
+            var seasonConfigRows = payload.action === 'addRows' ? (payload.rows || []).filter(function(r) {
+                return String(r.gameId || '').toUpperCase() === 'SEASON_CONFIG' || String(r.player || '').toUpperCase() === 'SEASON_CONFIG';
+            }) : [];
+            if (seasonConfigRows.length) {
+                var expectedMax = Math.max.apply(null, seasonConfigRows.map(function(r) { return Number(r.season || r.score || 1); }));
+                if ((parsed.maxSeason || 1) < expectedMax) return false;
+            }
+
+            var expected = payload.action === 'addRows' ? (payload.rows || []).filter(function(r) {
+                return String(r.gameId || '').toUpperCase() !== 'SEASON_CONFIG' && String(r.player || '').toUpperCase() !== 'SEASON_CONFIG';
+            }) : (payload.action === 'editRound' ? (payload.updates || []) : []);
+            if (!expected.length) return seasonConfigRows.length > 0;
+
+            return expected.every(function(row) {
+                var gameId = String(row.gameId == null ? '' : row.gameId);
+                var season = Number(row.season || 1);
+                var roundNumber = Number(row.round != null ? row.round : row.roundNumber);
+                var playerName = String(row.player != null ? row.player : row.playerName || '').trim().toLowerCase();
+                var expectedScore = Number(row.score);
+                var expectedDistributor = isDistributorValue(row.distributor);
+                var game = parsed.find(function(g) { return String(g.id) === gameId && Number(g.season || 1) === season; });
+                if (!game || String(game.date) !== String(row.date || game.date)) return false;
+                var round = game.rounds.find(function(r) { return Number(r.roundNumber) === roundNumber; });
+                if (!round) return false;
+                var score = round.scores.find(function(s) { return String(s.player).trim().toLowerCase() === playerName; });
+                if (!score || Number(score.score) !== expectedScore || isDistributorValue(score.distributor) !== expectedDistributor) return false;
+                if (payload.action === 'addRows') {
+                    if (String(score.leftNeighbor || '') !== String(row.left || '') || String(score.rightNeighbor || '') !== String(row.right || '')) return false;
+                }
+                return true;
+            });
+        }
+
+        function verifySheetPayload(payload, context) {
+            if (!sheetUrl) return Promise.reject(new Error('The Apps Script request was sent, but no Google Sheet URL is configured for verification. Add the published Sheet URL in Settings.'));
+            var attempt = 0, maxAttempts = 12;
+            function poll() {
+                attempt++;
+                return fetchSheetCsvText(sheetUrl).then(function(csvText) {
+                    if (sheetContainsPayload(payload, csvText)) {
+                        return { dispatched: true, verified: true, attempts: attempt, context: context || payload.action };
+                    }
+                    throw new Error('The submitted values are not visible in the published Sheet yet.');
+                }).catch(function(readError) {
+                    if (attempt >= maxAttempts) {
+                        throw new Error('The request was sent, but the Sheet could not be verified after ' + maxAttempts + ' checks. ' + readError.message + ' The write may still have succeeded; click “Refresh Tracker from Google Sheets” before trying again.');
+                    }
+                    return new Promise(function(resolve) { setTimeout(resolve, 2000); }).then(poll);
+                });
+            }
+            return poll();
+        }
+
+        // Apps Script's no-cors response is opaque. Therefore a completed POST is
+        // never treated as success: we poll the published Sheet and compare the
+        // actual stored rows with the submitted values before confirming.
+        function postAppsScriptPayload(payload, context) {
+            if (!scriptUrl) return Promise.reject(new Error('Apps Script URL is not configured.'));
+            if (!sheetUrl) return Promise.reject(new Error('Google Sheet URL is not configured, so the write cannot be verified. Add the published Sheet URL in Settings.'));
+            var body = 'payload=' + encodeURIComponent(JSON.stringify(payload));
+            return fetch(scriptUrl, { method: 'POST', mode: 'no-cors', body: body })
+                .then(function() { return verifySheetPayload(payload, context); });
         }
 
         function resetSettingsOnly() {
@@ -1595,12 +1699,9 @@
                     right:       '',
                     season:      currentSeason.toString()
                 }];
-                var payload = 'payload=' + encodeURIComponent(JSON.stringify({ action: 'addRows', rows: rows }));
-                fetch(scriptUrl, {
-                    method: 'POST',
-                    mode: 'no-cors',
-                    body: payload
-                }).catch(function(err) { console.error('Season sync error:', err); });
+                postAppsScriptPayload({ action: 'addRows', rows: rows }, 'season configuration')
+                    .then(function() { console.log('Season configuration verified in Google Sheets.'); })
+                    .catch(function(err) { console.error('Season configuration not verified:', err); });
             }
 
             document.getElementById('round-view').style.display = 'none';
@@ -1701,13 +1802,10 @@
                         season:      currentSeason.toString()
                     };
                 });
-                var payload = 'payload=' + encodeURIComponent(JSON.stringify({ action: 'addRows', rows: rows }));
-                fetch(scriptUrl, {
-                    method: 'POST',
-                    mode: 'no-cors',
-                    body: payload
-                }).catch(function(err) { console.error('Historical sync error:', err); });
-                sheetSynced = true;
+                postAppsScriptPayload({ action: 'addRows', rows: rows }, 'historical game')
+                    .then(function() { showImportStatus('Historical game saved and verified in Google Sheets.', 'success'); })
+                    .catch(function(err) { showImportStatus('Historical game NOT verified in Google Sheets. ' + err.message, 'error'); });
+                sheetSynced = false;
             }
 
             // Clear form
@@ -1715,7 +1813,7 @@
             document.getElementById('import-player-rows').innerHTML = '';
             importPlayerCount = 0;
 
-            showImportStatus(sheetSynced ? '✓ Game saved and synced to Google Sheets!' : '✓ Game saved locally (Google Sheets not configured).', 'success');
+            showImportStatus(scriptUrl ? 'Game saved locally. Google Sheets verification is pending; check the sync message/console before relying on it.' : 'Game saved locally (Google Sheets not configured).', 'success');
             renderImportHistory();
         }
 
@@ -1766,152 +1864,118 @@
                 alert('No Google Sheet URL configured. Go to Settings and add your sheet URL first.');
                 return;
             }
-            var btn = document.querySelector('.refresh-btn');
-            var label = document.getElementById('stats-last-updated');
-            if (btn) { btn.textContent = '⏳ Loading...'; btn.disabled = true; }
+            if (currentGame) {
+                alert('Finish or end the active game before refreshing from Google Sheets.');
+                return;
+            }
+            if (!confirm('Refresh will replace this device’s current and archived game data with the rows found in Google Sheets. A local backup will be saved first. Continue only if the Sheet is the version you want to use.')) return;
+            var btn = document.getElementById('refresh-sheet-btn');
+            var label = document.getElementById('sheet-refresh-status');
+            if (btn) { btn.textContent = '⏳ Refreshing...'; btn.disabled = true; }
             if (label) label.textContent = 'Fetching from Google Sheets...';
 
-            function normalizeUrl(url) {
-                if (url.includes('/pubhtml')) url = url.replace('/pubhtml', '/pub?output=csv');
-                var m1 = url.match(/\/spreadsheets\/d\/e\/([a-zA-Z0-9-_]+)/);
-                if (m1) { return url.includes('output=csv') ? url : 'https://docs.google.com/spreadsheets/d/e/' + m1[1] + '/pub?output=csv'; }
-                var m2 = url.match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
-                if (m2 && !url.includes('/pub?') && !url.includes('/export?')) { return 'https://docs.google.com/spreadsheets/d/' + m2[1] + '/export?format=csv&gid=0'; }
-                return url;
-            }
-
-            var csvUrl = normalizeUrl(sheetUrl);
-            var cacheBuster = (csvUrl.indexOf('?') > -1 ? '&' : '?') + '_=' + new Date().getTime();
-            var freshUrl = csvUrl + cacheBuster;
-            var proxyUrl = 'https://corsproxy.io/?' + encodeURIComponent(freshUrl);
-
-            function done(csvText) {
-                var parsed = parseCSVIntoGames(csvText);
-                if (parsed && parsed.length > 0) {
-                    // Find the max season in the sheet data
-                    var maxSheetSeason = 1;
-                    parsed.forEach(function(g) { if ((g.season||1) > maxSheetSeason) maxSheetSeason = g.season||1; });
-
-                    // Rebuild archivedSeasons from sheet data for all past seasons
-                    archivedSeasons = [];
-                    for (var s = 1; s < maxSheetSeason; s++) {
-                        var seasonGamesArr = parsed.filter(function(g) { return (g.season||1) === s; });
-                        if (seasonGamesArr.length === 0) continue;
-                        var _sw = seasonWinnerFromGames(seasonGamesArr, s);
-                        var winner = _sw.winner, winnerScore = _sw.winnerScore;
-                        var lastGame = seasonGamesArr.slice().sort(function(a,b){return new Date(b.date)-new Date(a.date);})[0];
-                        var year = lastGame ? new Date(lastGame.date).getFullYear() : new Date().getFullYear();
-                        archivedSeasons.push({ season: s, year: year, games: seasonGamesArr, winner: winner, winnerScore: winnerScore });
-                    }
-
-                    // Current season games only
-                    currentSeason = maxSheetSeason;
-                    games = parsed.filter(function(g) { return (g.season||1) === maxSheetSeason; });
-                    updateSeasonDisplay();
-                    saveData();
-                    renderStats();
-                    renderHistory();
-                    if (label) label.textContent = 'Last synced: ' + new Date().toLocaleTimeString();
-                } else {
-                    if (label) label.textContent = 'No data found in sheet';
-                }
-                if (btn) { btn.textContent = '↻ Refresh'; btn.disabled = false; }
-            }
-
-            function fail(err) {
-                if (label) label.textContent = 'Sync failed — check Settings';
-                if (btn) { btn.textContent = '↻ Refresh'; btn.disabled = false; }
-                console.error('Sheet refresh failed:', err);
-            }
-
-            fetch(freshUrl, { cache: 'no-store' })
-                .then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.text(); })
-                .catch(function() { return fetch(proxyUrl, { cache: 'no-store' }).then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.text(); }); })
-                .then(done)
+            fetchSheetCsvText(sheetUrl).then(done)
                 .catch(fail);
         }
 
         function parseCSVIntoGames(csvText) {
-            var lines = csvText.trim().split('\n');
-            if (lines.length < 2) return [];
-
-            function parseCSVLine(line) {
-                var result = [], current = '', inQuotes = false;
-                for (var i = 0; i < line.length; i++) {
-                    var ch = line[i];
-                    if (ch === '"') { inQuotes = !inQuotes; }
-                    else if (ch === ',' && !inQuotes) { result.push(current); current = ''; }
-                    else { current += ch; }
+            // Parse CSV as records, not physical lines: quoted cells may contain commas/newlines.
+            function csvRecords(text) {
+                var rows = [], row = [], cell = '', quoted = false;
+                text = String(text || '').replace(/^\uFEFF/, '');
+                for (var i = 0; i < text.length; i++) {
+                    var ch = text[i], next = text[i + 1];
+                    if (ch === '"' && quoted && next === '"') { cell += '"'; i++; }
+                    else if (ch === '"') { quoted = !quoted; }
+                    else if (ch === ',' && !quoted) { row.push(cell); cell = ''; }
+                    else if ((ch === '\n' || ch === '\r') && !quoted) {
+                        if (ch === '\r' && next === '\n') i++;
+                        row.push(cell); cell = '';
+                        if (row.some(function(v) { return String(v).trim() !== ''; })) rows.push(row);
+                        row = [];
+                    } else { cell += ch; }
                 }
-                result.push(current);
-                return result;
+                row.push(cell);
+                if (row.some(function(v) { return String(v).trim() !== ''; })) rows.push(row);
+                return rows;
             }
-
-            var gameMap = new Map();
-            for (var i = 1; i < lines.length; i++) {
-                var line = lines[i].trim();
-                if (!line) continue;
-                var cols = parseCSVLine(line);
-                var hasGameId = cols.length >= 9;
+            function norm(v) { return String(v || '').toLowerCase().replace(/[^a-z0-9]/g, ''); }
+            function findCol(headers, names, fallback) {
+                for (var i = 0; i < names.length; i++) {
+                    var at = headers.indexOf(names[i]);
+                    if (at >= 0) return at;
+                }
+                return fallback;
+            }
+            var records = csvRecords(csvText);
+            if (records.length < 2) return [];
+            var headers = records[0].map(norm);
+            var hasHeaderGameId = headers.some(function(h) { return h === 'gameid' || h === 'gameidentifier'; });
+            var hasGameId = hasHeaderGameId || records[1].length >= 10;
+            var idx = hasHeaderGameId ? {
+                gameId: findCol(headers, ['gameid','gameidentifier'], 1), date: findCol(headers, ['date','gamedate'], 2),
+                round: findCol(headers, ['round','roundnumber'], 3), player: findCol(headers, ['player','playername'], 4),
+                score: findCol(headers, ['score','points'], 5), distributor: findCol(headers, ['distributor','isdistributor'], 6),
+                left: findCol(headers, ['left','leftneighbor'], 7), right: findCol(headers, ['right','rightneighbor'], 8),
+                season: findCol(headers, ['season','seasonnumber'], 9)
+            } : null;
+            var gameMap = new Map(), configuredMaxSeason = 0, rowMap = new Map();
+            for (var r = 1; r < records.length; r++) {
+                var cols = records[r].map(function(v) { return String(v == null ? '' : v).trim(); });
                 if (cols.length < 6) continue;
-
-                var gameId, date, roundNumber, playerName, score, distributor, leftNeighbor, rightNeighbor;
-                var col7IsSeasonNum = false;
-                var col7v = '', col8v = '', col9v = '';
+                var gameId, date, roundNumber, playerName, score, distributor, leftNeighbor, rightNeighbor, season = 1;
                 if (hasGameId) {
-                    gameId = cols[1].trim(); date = cols[2].trim(); roundNumber = parseInt(cols[3].trim());
-                    playerName = cols[4].trim(); score = parseInt(cols[5].trim()); distributor = parseInt(cols[6].trim());
-                    col7v = cols[7] ? cols[7].trim() : '';
-                    col8v = cols[8] ? cols[8].trim() : '';
-                    col9v = cols[9] ? cols[9].trim() : '';
-                    // Auto-detect: if col[7] is a small integer it's the season number, neighbors are at col[8] and col[9]
-                    col7IsSeasonNum = !!col7v && /^\d+$/.test(col7v) && parseInt(col7v) >= 1 && parseInt(col7v) <= 999;
-                    if (col7IsSeasonNum) {
-                        leftNeighbor = col8v;
-                        rightNeighbor = col9v;
-                    } else {
-                        leftNeighbor = col7v;
-                        rightNeighbor = col8v;
+                    var c = idx || { gameId:1, date:2, round:3, player:4, score:5, distributor:6, left:7, right:8, season:9 };
+                    gameId = cols[c.gameId] || ''; date = cols[c.date] || '';
+                    roundNumber = parseInt(cols[c.round], 10); playerName = cols[c.player] || '';
+                    score = Number(cols[c.score]); distributor = parseInt(cols[c.distributor], 10) || 0;
+                    leftNeighbor = cols[c.left] || ''; rightNeighbor = cols[c.right] || '';
+                    var rawSeason = cols[c.season] || '';
+                    // Support the legacy alternate layout where Season precedes the neighbors.
+                    if ((!rawSeason || !/^\d+$/.test(rawSeason)) && !idx && /^\d+$/.test(cols[7] || '') && Number(cols[7]) > 0) {
+                        rawSeason = cols[7]; leftNeighbor = cols[8] || ''; rightNeighbor = cols[9] || '';
+                    }
+                    var parsedSeason = parseInt(rawSeason, 10);
+                    if (parsedSeason > 0) season = parsedSeason;
+                    if (gameId === 'SEASON_CONFIG' || playerName === 'SEASON_CONFIG') {
+                        configuredMaxSeason = Math.max(configuredMaxSeason, parseInt(rawSeason || cols[5], 10) || 0);
+                        continue;
                     }
                 } else {
-                    date = cols[1].trim(); roundNumber = parseInt(cols[2].trim());
-                    playerName = cols[3].trim(); score = parseInt(cols[4].trim()); distributor = parseInt(cols[5].trim());
-                    leftNeighbor = cols[6] ? cols[6].trim() : ''; rightNeighbor = cols[7] ? cols[7].trim() : '';
-                    var gamesForDate = [];
-                    gameMap.forEach(function(g, key) { if (g.date === date) gamesForDate.push({ key: key, game: g }); });
-                    if (gamesForDate.length === 0) { gameId = date + '_1'; }
+                    // Legacy schema: timestamp,date,round,player,score,distributor,left,right
+                    date = cols[1] || ''; roundNumber = parseInt(cols[2], 10); playerName = cols[3] || '';
+                    score = Number(cols[4]); distributor = parseInt(cols[5], 10) || 0;
+                    leftNeighbor = cols[6] || ''; rightNeighbor = cols[7] || '';
+                    var prior = [];
+                    gameMap.forEach(function(g, key) { if (g.date === date) prior.push({key:key, game:g}); });
+                    if (!prior.length) gameId = date + '_1';
                     else {
-                        var lastGame = gamesForDate[gamesForDate.length - 1];
-                        var maxRound = 0;
-                        lastGame.game.rounds.forEach(function(r) { if (r.roundNumber > maxRound) maxRound = r.roundNumber; });
-                        gameId = (roundNumber === 1 && maxRound > 1) ? date + '_' + (gamesForDate.length + 1) : lastGame.key;
+                        var last = prior[prior.length - 1], maxRound = 0;
+                        last.game.rounds.forEach(function(rr) { maxRound = Math.max(maxRound, rr.roundNumber); });
+                        gameId = roundNumber === 1 && maxRound > 1 ? date + '_' + (prior.length + 1) : last.game.id;
                     }
                 }
-
-                // Read season column (auto-detected: col[7] if it's a number, otherwise col[9])
-                var season = 1;
-                if (hasGameId) {
-                    var seasonStr = col7IsSeasonNum ? col7v : col9v;
-                    var ps = parseInt(seasonStr);
-                    if (!isNaN(ps) && ps > 0) season = ps;
-                }
-
-                if (!date || isNaN(roundNumber) || !playerName || isNaN(score)) continue;
-                if (!gameMap.has(gameId)) gameMap.set(gameId, { id: gameId, date: date, rounds: new Map(), season: season });
-                var game = gameMap.get(gameId);
-                game.season = season; // update in case later rows have season info
-                if (!game.rounds.has(roundNumber)) game.rounds.set(roundNumber, { roundNumber: roundNumber, scores: [] });
-                game.rounds.get(roundNumber).scores.push({ player: playerName, score: score, distributor: distributor, leftNeighbor: leftNeighbor, rightNeighbor: rightNeighbor });
+                if (!gameId || !date || !Number.isInteger(roundNumber) || roundNumber < 1 || !playerName || !Number.isFinite(score)) continue;
+                var rowKey = season + '|' + gameId + '|' + roundNumber + '|' + playerName.toLowerCase();
+                // Last row wins when a round was corrected by an append-only Sheet workflow.
+                rowMap.set(rowKey, { gameId:gameId, date:date, roundNumber:roundNumber, player:playerName, score:score,
+                    distributor:distributor, leftNeighbor:leftNeighbor, rightNeighbor:rightNeighbor, season:season });
             }
-
-            var result = [];
-            gameMap.forEach(function(game) {
-                var rounds = [];
-                game.rounds.forEach(function(r) { rounds.push(r); });
-                rounds.sort(function(a, b) { return a.roundNumber - b.roundNumber; });
-                result.push({ id: game.id, date: game.date, rounds: rounds, season: game.season || 1 });
+            rowMap.forEach(function(rec) {
+                var gameKey = String(rec.season || 1) + '|' + rec.gameId;
+                if (!gameMap.has(gameKey)) gameMap.set(gameKey, { id:rec.gameId, date:rec.date, rounds:new Map(), season:rec.season });
+                var g = gameMap.get(gameKey); g.season = rec.season || g.season || 1;
+                if (!g.rounds.has(rec.roundNumber)) g.rounds.set(rec.roundNumber, {roundNumber:rec.roundNumber, scores:[]});
+                g.rounds.get(rec.roundNumber).scores.push({player:rec.player, score:rec.score, distributor:rec.distributor,
+                    leftNeighbor:rec.leftNeighbor, rightNeighbor:rec.rightNeighbor});
             });
-            result.sort(function(a, b) { return new Date(b.date) - new Date(a.date); });
+            var result = [];
+            gameMap.forEach(function(g) {
+                var rounds = Array.from(g.rounds.values()).sort(function(a,b){return a.roundNumber-b.roundNumber;});
+                result.push({id:g.id, date:g.date, rounds:rounds, season:g.season || 1});
+            });
+            result.sort(function(a,b){return new Date(b.date)-new Date(a.date);});
+            result.maxSeason = Math.max(configuredMaxSeason, result.reduce(function(m,g){return Math.max(m,g.season||1);}, 1));
             return result;
         }
 
@@ -1965,6 +2029,7 @@
                 date: date,
                 playerNames: tempPlayers.slice(),
                 seatingOrder: tempPlayers.slice(),
+                season: currentSeason,
                 rounds: []
             };
 
@@ -2111,7 +2176,7 @@
             this.reset();
             showRoundView();
             
-            alert('Round ' + round.roundNumber + ' saved! 🎉');
+            alert('Round ' + round.roundNumber + ' saved on this device. Google Sheets verification is running; the result will appear in the sync notice.');
         });
 
         function submitRoundToGoogleForms(round) {
@@ -2121,6 +2186,9 @@
             
             var indicator = document.createElement('div');
             indicator.id = 'sync-indicator';
+            indicator.style.cssText = 'position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);background:#d68910;color:white;padding:24px 36px;border-radius:14px;font-size:18px;font-weight:700;z-index:99999;';
+            indicator.textContent = 'Sending round and verifying Google Sheets...';
+            document.body.appendChild(indicator);
             
             // Check if Apps Script URL is configured
             if (!scriptUrl) {
@@ -2147,29 +2215,23 @@
                     distributor: scoreData.distributor.toString(),
                     left:        scoreData.leftNeighbor || '',
                     right:       scoreData.rightNeighbor || '',
-                    season:      currentSeason.toString()
+                    season:      String(currentGame.season || currentSeason || 1)
                 };
             });
 
-            // Submit to Apps Script
-            var payload = 'payload=' + encodeURIComponent(JSON.stringify({ action: 'addRows', rows: rows }));
-            fetch(scriptUrl, {
-                method: 'POST',
-                mode: 'no-cors',
-                body: payload
-            }).catch(function(err) {
-                console.error('Apps Script submission error:', err);
-            });
-            
-            // Show BIG success indicator
-            indicator.style.cssText = 'position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);background:#1dd1a1;color:white;padding:30px 50px;border-radius:16px;font-size:24px;font-weight:700;z-index:99999;box-shadow:0 8px 32px rgba(0,0,0,0.5);animation:pulse 0.3s ease-in-out;';
-            indicator.innerHTML = '✓ Synced to Google Sheets!';
-            document.body.appendChild(indicator);
-            setTimeout(function() {
-                indicator.style.opacity = '0';
-                indicator.style.transition = 'opacity 0.8s';
-                setTimeout(function() { indicator.remove(); }, 800);
-            }, 5000);
+            postAppsScriptPayload({ action: 'addRows', rows: rows }, 'game round')
+                .then(function(result) {
+                    indicator.style.cssText = 'position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);background:#287a43;color:white;padding:30px 50px;border-radius:16px;font-size:22px;font-weight:700;z-index:99999;box-shadow:0 8px 32px rgba(0,0,0,0.5);';
+                    indicator.textContent = '✓ Saved and verified in Google Sheets';
+                    document.body.appendChild(indicator);
+                    setTimeout(function() { indicator.remove(); }, 4000);
+                })
+                .catch(function(err) {
+                    indicator.style.cssText = 'position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);background:#c0392b;color:white;padding:24px 32px;border-radius:14px;font-size:17px;font-weight:700;z-index:99999;max-width:90%;';
+                    indicator.textContent = 'NOT VERIFIED in Google Sheets. Local round is saved. ' + err.message;
+                    document.body.appendChild(indicator);
+                    setTimeout(function() { indicator.remove(); }, 9000);
+                });
         }
 
         function endGame() {
@@ -2177,6 +2239,7 @@
                 return;
             }
 
+            if (!currentGame.season) currentGame.season = currentSeason;
             games.push(currentGame);
             currentGame = null;
             saveData();
@@ -3098,195 +3161,133 @@
             return res;
         }
 
-        function calculateStats() {
-            const playerMap = new Map();
-            let totalRounds = 0;
+        function isDistributorValue(value) {
+        if (value === true || value === 1) return true;
+        var normalized = String(value == null ? '' : value).trim().toLowerCase();
+        return normalized === '1' || normalized === '1.0' || normalized === 'true' || normalized === 'yes';
+    }
 
-            if (!games || !Array.isArray(games)) {
-                return { totalRounds: 0, playerStats: [], rankings: [], yeniSkorRankings: [] };
-            }
+    function calculateStats() {
+        var playerMap = new Map();
+        var totalRounds = 0;
 
-            games.forEach(function(game) {
-                if (!game || !game.rounds || !Array.isArray(game.rounds)) return;
+        if (!games || !Array.isArray(games)) return { totalRounds: 0, playerStats: [], rankings: [], yeniSkorRankings: [] };
 
-                // Historical games: the single round score IS the game total — skip dist/neighbor
-                if (game.historical) {
-                    const gamePlayerTotals = new Map();
-                    game.rounds[0].scores.forEach(function(scoreData) {
-                        if (!scoreData || !scoreData.player) return;
-                        const p = scoreData.player;
-                        const s = scoreData.score || 0;
-                        if (!playerMap.has(p)) {
-                            playerMap.set(p, {
-                                name: p, gameTotals: [],
-                                distScoreTotal: 0, distRounds: 0,
-                                nonDistScoreTotal: 0, nonDistRounds: 0,
-                                totalPoints: 0, totalRounds: 0,
-                                neighborLeft: new Map(), neighborRight: new Map(),
-                                firstPlace: 0, secondPlace: 0, thirdPlace: 0, fourthPlace: 0,
-                                yeniSkor: 0
-                            });
-                        }
-                        const stats = playerMap.get(p);
-                        stats.totalPoints += s;
-                        gamePlayerTotals.set(p, s);
-                    });
-                    // Placements
-                    if (gamePlayerTotals.size > 0) {
-                        const sorted = Array.from(gamePlayerTotals.entries()).sort(function(a, b) { return b[1] - a[1]; });
-                        var currentRank = 1, previousScore = null;
-                        sorted.forEach(function(entry) {
-                            const p = entry[0], score = entry[1];
-                            const stats = playerMap.get(p);
-                            stats.gameTotals.push(score);
-                            if (previousScore !== null && score < previousScore) currentRank++;
-                            previousScore = score;
-                            stats.yeniSkor += yeniSkorPoints(seasonOfGame(game), currentRank);
-                            if (currentRank === 1) { stats.firstPlace++; }
-                            else if (currentRank === 2) { stats.secondPlace++; }
-                            else if (currentRank === 3) { stats.thirdPlace++; }
-                            else if (currentRank === 4) { stats.fourthPlace++; }
+        games.forEach(function(game) {
+            if (!game || !Array.isArray(game.rounds)) return;
+            var gamePlayerTotals = new Map();
+
+            game.rounds.forEach(function(round) {
+                if (!round || !Array.isArray(round.scores)) return;
+                totalRounds++;
+
+                // Determine if this round has distributor data:
+                // at least one player must explicitly have distributor === true
+                var roundHasDistributor = round.scores.some(function(sd) { return isDistributorValue(sd.distributor); });
+
+                round.scores.forEach(function(scoreData) {
+                    if (!scoreData.player) return;
+                    var p = scoreData.player;
+                    var s = scoreData.score || 0;
+
+                    if (!playerMap.has(p)) {
+                        playerMap.set(p, {
+                            name: p,
+                            gameTotals: [],
+                            distScoreTotal: 0, distRounds: 0,
+                            nonDistScoreTotal: 0, nonDistRounds: 0,
+                            totalPoints: 0, totalRounds: 0,
+                            neighborLeft: new Map(), neighborRight: new Map(),
+                            firstPlace: 0, secondPlace: 0, thirdPlace: 0, fourthPlace: 0, yeniSkor: 0
                         });
                     }
-                    return; // skip normal round processing
-                }
 
-                // Accumulate per-game totals per player
-                const gamePlayerTotals = new Map();
+                    var stats = playerMap.get(p);
+                    stats.totalPoints += s;
+                    stats.totalRounds++;
+                    gamePlayerTotals.set(p, (gamePlayerTotals.get(p) || 0) + s);
 
-                game.rounds.forEach(function(round) {
-                    if (!round || !round.scores || !Array.isArray(round.scores)) return;
-                    totalRounds++;
-
-                    // Determine if this round has distributor data:
-                    // at least one player must explicitly have distributor === 1
-                    const roundHasDistributor = round.scores.some(function(sd) { return sd.distributor === 1; });
-
-                    round.scores.forEach(function(scoreData) {
-                        if (!scoreData || !scoreData.player) return;
-                        const p = scoreData.player;
-                        const s = scoreData.score || 0;
-
-                        if (!playerMap.has(p)) {
-                            playerMap.set(p, {
-                                name: p,
-                                gameTotals: [],        // total score per game
-                                distScoreTotal: 0,     // sum of scores in rounds as Dağıtan
-                                distRounds: 0,         // count of rounds as Dağıtan
-                                nonDistScoreTotal: 0,
-                                nonDistRounds: 0,
-                                totalPoints: 0,
-                                totalRounds: 0,
-                                neighborLeft: new Map(),  // neighbor -> { scoreTotal, rounds }
-                                neighborRight: new Map(),
-                                firstPlace: 0, secondPlace: 0, thirdPlace: 0, fourthPlace: 0,
-                                yeniSkor: 0
-                            });
+                    // Only accumulate distributor stats if this round has distributor data
+                    if (roundHasDistributor) {
+                        if (isDistributorValue(scoreData.distributor)) {
+                            stats.distScoreTotal += s;
+                            stats.distRounds++;
+                        } else {
+                            stats.nonDistScoreTotal += s;
+                            stats.nonDistRounds++;
                         }
+                    }
 
-                        const stats = playerMap.get(p);
-                        stats.totalPoints += s;
-                        stats.totalRounds++;
-
-                        // Accumulate game total
-                        gamePlayerTotals.set(p, (gamePlayerTotals.get(p) || 0) + s);
-
-                        // Only accumulate distributor stats if this round has distributor data
-                        if (roundHasDistributor) {
-                            if (scoreData.distributor === 1) {
-                                stats.distScoreTotal += s;
-                                stats.distRounds++;
-                            } else {
-                                stats.nonDistScoreTotal += s;
-                                stats.nonDistRounds++;
-                            }
-                        }
-
-                        // Neighbor accumulation (raw rounds, not per-game)
-                        // Fall back to game.seatingOrder if stored leftNeighbor/rightNeighbor are empty
-                        // (happens when data was refreshed from a Google Sheet that lacks neighbor columns)
-                        var _nb = (!scoreData.leftNeighbor && game.seatingOrder)
-                            ? getNeighbors(scoreData.player, game.seatingOrder)
-                            : { left: scoreData.leftNeighbor, right: scoreData.rightNeighbor };
-                        const left = (_nb.left) || '';
-                        const right = (_nb.right) || '';
-                        if (left && right) {
-                            if (!stats.neighborLeft.has(left)) stats.neighborLeft.set(left, { scoreTotal: 0, rounds: 0 });
-                            const n = stats.neighborLeft.get(left);
-                            n.scoreTotal += s; n.rounds++;
-                            if (!stats.neighborRight.has(right)) stats.neighborRight.set(right, { scoreTotal: 0, rounds: 0 });
-                            const n2 = stats.neighborRight.get(right);
-                            n2.scoreTotal += s; n2.rounds++;
-                        }
-                    });
+                    var left = scoreData.leftNeighbor || '', right = scoreData.rightNeighbor || '';
+                    if (left && right) {
+                        if (!stats.neighborLeft.has(left)) stats.neighborLeft.set(left, { scoreTotal: 0, rounds: 0 });
+                        var nl = stats.neighborLeft.get(left); nl.scoreTotal += s; nl.rounds++;
+                        if (!stats.neighborRight.has(right)) stats.neighborRight.set(right, { scoreTotal: 0, rounds: 0 });
+                        var nr = stats.neighborRight.get(right); nr.scoreTotal += s; nr.rounds++;
+                    }
                 });
-
-                // Record this game's total for each player, and handle placements
-                if (gamePlayerTotals.size > 0) {
-                    const sorted = Array.from(gamePlayerTotals.entries()).sort(function(a, b) { return b[1] - a[1]; });
-                    var currentRank = 1, previousScore = null;
-                    sorted.forEach(function(entry) {
-                        const p = entry[0], score = entry[1];
-                        const stats = playerMap.get(p);
-                        stats.gameTotals.push(score);
-                        if (previousScore !== null && score < previousScore) currentRank++;
-                        previousScore = score;
-                        stats.yeniSkor += yeniSkorPoints(seasonOfGame(game), currentRank);
-                        if (currentRank === 1) { stats.firstPlace++; }
-                        else if (currentRank === 2) { stats.secondPlace++; }
-                        else if (currentRank === 3) { stats.thirdPlace++; }
-                        else if (currentRank === 4) { stats.fourthPlace++; }
-                    });
-                }
             });
 
-            const playerStats = Array.from(playerMap.values()).map(function(player) {
-                if (!player.gameTotals.length) return null;
-
-                // Avg score = sum of game totals / number of games
-                const avgScore = player.gameTotals.reduce(function(a, b) { return a + b; }, 0) / player.gameTotals.length;
-
-                // Avg as Dağıtan = total dist score / total dist rounds
-                const avgScoreAsDistributor = player.distRounds > 0 ? player.distScoreTotal / player.distRounds : null;
-
-                // Avg as not Dağıtan = total non-dist score / total non-dist rounds
-                const avgScoreNotDistributor = player.nonDistRounds > 0 ? player.nonDistScoreTotal / player.nonDistRounds : null;
-
-                const leftNeighborStats = [], rightNeighborStats = [];
-                player.neighborLeft.forEach(function(val, neighbor) {
-                    if (val.rounds < 1) return;
-                    leftNeighborStats.push({ neighbor: neighbor, avgScore: val.scoreTotal / val.rounds, rounds: val.rounds });
+            if (gamePlayerTotals.size > 0) {
+                var sorted = Array.from(gamePlayerTotals.entries()).sort(function(a, b) { return b[1] - a[1]; });
+                var currentRank = 1, prevScore = null;
+                sorted.forEach(function(entry) {
+                    var pName = entry[0], pScore = entry[1];
+                    var stats = playerMap.get(pName);
+                    stats.gameTotals.push(pScore);
+                    if (prevScore !== null && pScore < prevScore) currentRank++;
+                    prevScore = pScore;
+                    stats.yeniSkor += yeniSkorPoints(seasonOfGame(game), currentRank);
+                    if (currentRank === 1) { stats.firstPlace++; }
+                    else if (currentRank === 2) { stats.secondPlace++; }
+                    else if (currentRank === 3) { stats.thirdPlace++; }
+                    else if (currentRank === 4) { stats.fourthPlace++; }
                 });
-                player.neighborRight.forEach(function(val, neighbor) {
-                    if (val.rounds < 1) return;
-                    rightNeighborStats.push({ neighbor: neighbor, avgScore: val.scoreTotal / val.rounds, rounds: val.rounds });
-                });
-                leftNeighborStats.sort(function(a, b) { return b.avgScore - a.avgScore; });
-                rightNeighborStats.sort(function(a, b) { return b.avgScore - a.avgScore; });
+            }
+        });
 
-                return {
-                    name: player.name,
-                    totalRounds: player.totalRounds,
-                    totalGames: player.gameTotals.length,
-                    avgScore: avgScore,
-                    totalPoints: player.totalPoints,
-                    avgScoreAsDistributor: avgScoreAsDistributor,
-                    avgScoreNotDistributor: avgScoreNotDistributor,
-                    leftNeighborStats: leftNeighborStats,
-                    rightNeighborStats: rightNeighborStats,
-                    firstPlace: player.firstPlace,
-                    secondPlace: player.secondPlace,
-                    thirdPlace: player.thirdPlace,
-                    fourthPlace: player.fourthPlace,
-                    yeniSkor: player.yeniSkor
-                };
-            }).filter(function(p) { return p !== null; });
+        var playerStats = Array.from(playerMap.values()).map(function(player) {
+            if (!player.gameTotals.length) return null;
 
-            const rankings = playerStats.slice().sort(function(a, b) { return b.totalPoints - a.totalPoints; });
-            const yeniSkorRankings = playerStats.slice().sort(function(a, b) { return b.yeniSkor - a.yeniSkor; });
+            var avgScore = player.gameTotals.reduce(function(a, b) { return a + b; }, 0) / player.gameTotals.length;
+            var avgDist = player.distRounds > 0 ? player.distScoreTotal / player.distRounds : null;
+            var avgNonDist = player.nonDistRounds > 0 ? player.nonDistScoreTotal / player.nonDistRounds : null;
 
-            return { totalRounds: totalRounds, playerStats: playerStats, rankings: rankings, yeniSkorRankings: yeniSkorRankings };
-        }
+            var leftNeighborStats = [], rightNeighborStats = [];
+            player.neighborLeft.forEach(function(val, neighbor) {
+                if (val.rounds < 1) return;
+                leftNeighborStats.push({ neighbor: neighbor, avgScore: val.scoreTotal / val.rounds, rounds: val.rounds });
+            });
+            player.neighborRight.forEach(function(val, neighbor) {
+                if (val.rounds < 1) return;
+                rightNeighborStats.push({ neighbor: neighbor, avgScore: val.scoreTotal / val.rounds, rounds: val.rounds });
+            });
+            leftNeighborStats.sort(function(a, b) { return b.avgScore - a.avgScore; });
+            rightNeighborStats.sort(function(a, b) { return b.avgScore - a.avgScore; });
+
+            return {
+                name: player.name,
+                totalRounds: player.totalRounds,
+                totalGames: player.gameTotals.length,
+                avgScore: avgScore,
+                totalPoints: player.totalPoints,
+                avgScoreAsDistributor: avgDist,
+                avgScoreNotDistributor: avgNonDist,
+                leftNeighborStats: leftNeighborStats,
+                rightNeighborStats: rightNeighborStats,
+                firstPlace: player.firstPlace, secondPlace: player.secondPlace,
+                thirdPlace: player.thirdPlace, fourthPlace: player.fourthPlace,
+                yeniSkor: player.yeniSkor
+            };
+        }).filter(function(p) { return p !== null; });
+
+        return {
+            totalRounds: totalRounds,
+            playerStats: playerStats,
+            rankings: playerStats.slice().sort(function(a, b) { return b.totalPoints - a.totalPoints; }),
+            yeniSkorRankings: playerStats.slice().sort(function(a, b) { return b.yeniSkor - a.yeniSkor; })
+        };
+    }
 
         function renderHistory() {
             const content = document.getElementById('history-content');
@@ -3985,34 +3986,27 @@
                     roundNumber: String(round.roundNumber),
                     playerName: sd.player,
                     score: String(sd.score),
-                    distributor: String(sd.distributor)
+                    distributor: String(sd.distributor),
+                    season: String(game.season || currentSeason || 1)
                 };
             });
 
-            // Use no-cors to avoid CORS preflight issues with Apps Script
-            // We can't read the response in no-cors mode, so we show optimistic success
-            var formBody = 'payload=' + encodeURIComponent(JSON.stringify({ action: 'editRound', updates: updates }));
-
-            fetch(scriptUrl, {
-                method: 'POST',
-                mode: 'no-cors',
-
-                body: formBody
-            })
+            postAppsScriptPayload({ action: 'editRound', updates: updates }, 'round edit')
             .then(function() {
                 indicator.remove();
                 var msg = document.createElement('div');
-                msg.style.cssText = 'position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);background:#1dd1a1;color:white;padding:24px 40px;border-radius:14px;font-size:20px;font-weight:700;z-index:99999;box-shadow:0 8px 32px rgba(0,0,0,0.5);';
-                msg.textContent = '\u2713 Sent to Google Sheet!';
+                msg.style.cssText = 'position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);background:#287a43;color:white;padding:24px 40px;border-radius:14px;font-size:19px;font-weight:700;z-index:99999;box-shadow:0 8px 32px rgba(0,0,0,0.5);';
+                msg.textContent = '✓ Edit saved and verified in Google Sheets.';
                 document.body.appendChild(msg);
-                setTimeout(function() { msg.remove(); }, 3000);
+                setTimeout(function() { msg.remove(); }, 4000);
             })
             .catch(function(err) {
                 indicator.remove();
-                alert('Could not reach Apps Script. Check your URL in Settings.\n' + err.message);
+                alert('EDIT NOT VERIFIED in Google Sheets. Your local copy was saved. If the Sheet did not update, click “Refresh Tracker from Google Sheets” to reload the Sheet version.\n\n' + err.message);
             });
 
             closeEditRoundModal();
+            renderStats();
             renderHistory();
         }
 
