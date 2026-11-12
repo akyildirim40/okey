@@ -1063,7 +1063,7 @@
     }
 
     function buildRadarChartHTML(playerStats) {
-        var html = '<div style="background:#f8f9fa;border-radius:12px;padding:16px;margin-bottom:20px;">';
+        var html = '<div class="chart-card" style="background:#f8f9fa;border-radius:12px;padding:16px;margin-bottom:20px;">';
         html += '<div style="font-size:11px;color:#888;margin-bottom:12px;text-align:center;">Higher score = better performance · Each spoke = one player</div>';
         html += '<svg id="radar-chart" width="100%" viewBox="0 0 380 360" style="display:block;margin:0 auto;overflow:visible;"></svg>';
         html += '<div style="display:flex;justify-content:center;gap:24px;margin-top:12px;">';
@@ -1076,26 +1076,30 @@
     function drawRadarChart(playerStats) {
         var svg = document.getElementById('radar-chart');
         if (!svg || !playerStats || playerStats.length === 0) return;
+        
         var players = playerStats.filter(function(p) {
             return p.avgScoreAsDistributor !== null || p.avgScoreNotDistributor !== null;
         }).sort(function(a, b) { return a.name.localeCompare(b.name); });
         if (players.length === 0) return;
 
         var cx = 190, cy = 175, maxR = 130, levels = 4, n = players.length;
+        
+        // Determine score range
         var allScores = [];
         players.forEach(function(p) {
             if (p.avgScoreAsDistributor !== null) allScores.push(p.avgScoreAsDistributor);
             if (p.avgScoreNotDistributor !== null) allScores.push(p.avgScoreNotDistributor);
         });
         var minVal = 0;
-        var maxVal = 1;   // outer ring = 1.0 avg score
-                         // (real values top out near 0.6; raise this if that changes)
+        var maxVal = 1;   // Fixed outer ring = 1.0; keep identical across players and seasons.
 
         function angle(i) { return (i / n) * 2 * Math.PI - Math.PI / 2; }
         function scaleR(val) { var r = ((val - minVal) / (maxVal - minVal)) * maxR; return r < 0 ? 0 : (r > maxR ? maxR : r); }
         function pt(i, r) { var a = angle(i); return { x: cx + r * Math.cos(a), y: cy + r * Math.sin(a) }; }
 
         var svgHTML = '';
+
+        // Grid rings
         for (var l = 1; l <= levels; l++) {
             var r = (l / levels) * maxR;
             var pts = players.map(function(_, i) { return pt(i, r); });
@@ -1106,40 +1110,45 @@
             var lp = pt(0, r);
             svgHTML += '<text x="' + (lp.x + 4).toFixed(1) + '" y="' + (lp.y - 3).toFixed(1) + '" font-size="8" fill="#bbb" font-family="monospace">' + labelVal + '</text>';
         }
+
+        // Spokes
         players.forEach(function(_, i) {
             var outer = pt(i, maxR);
             svgHTML += '<line x1="' + cx + '" y1="' + cy + '" x2="' + outer.x.toFixed(1) + '" y2="' + outer.y.toFixed(1) + '" stroke="#dde8e1" stroke-width="1"/>';
         });
+
         function buildPoly(key) {
             return players.map(function(p, i) {
                 var val = key === 'dagitan' ? p.avgScoreAsDistributor : p.avgScoreNotDistributor;
-                var r2 = scaleR(val || 0);
-                var pos = pt(i, r2);
+                var r = scaleR(val || 0);
+                var pos = pt(i, r);
                 return (i === 0 ? 'M' : 'L') + pos.x.toFixed(1) + ',' + pos.y.toFixed(1);
             }).join(' ') + ' Z';
         }
+
         svgHTML += '<path d="' + buildPoly('notDagitan') + '" fill="rgba(52,120,200,0.32)" stroke="#3478c8" stroke-width="2.5" stroke-linejoin="round"/>';
         svgHTML += '<path d="' + buildPoly('dagitan') + '" fill="rgba(45,122,74,0.38)" stroke="#2d7a4a" stroke-width="2.5" stroke-linejoin="round"/>';
 
-        // Interactive dots
+        // Interactive dots — store dot data for event binding after innerHTML
         var dotData = [];
         players.forEach(function(p, i) {
             [['dagitan', '#2d7a4a', 'Dağıtan'], ['notDagitan', '#3478c8', 'Not Dağıtan']].forEach(function(pair) {
                 var val = pair[0] === 'dagitan' ? p.avgScoreAsDistributor : p.avgScoreNotDistributor;
                 if (val === null) return;
-                var r2 = scaleR(val);
-                var pos = pt(i, r2);
+                var r = scaleR(val);
+                var pos = pt(i, r);
                 var dotId = 'rdot-' + i + '-' + pair[0];
                 svgHTML += '<circle id="' + dotId + '" cx="' + pos.x.toFixed(1) + '" cy="' + pos.y.toFixed(1) + '" r="5" fill="' + pair[1] + '" stroke="#fff" stroke-width="1.5" style="cursor:pointer;" />';
                 dotData.push({ id: dotId, name: p.name, label: pair[2], val: val, color: pair[1], x: pos.x, y: pos.y });
             });
         });
 
-        // Static score labels with overlap handling
+        // Static score labels
         players.forEach(function(p, i) {
             var dVal = p.avgScoreAsDistributor !== null ? p.avgScoreAsDistributor : null;
             var nVal = p.avgScoreNotDistributor !== null ? p.avgScoreNotDistributor : null;
             var a = angle(i);
+            // Offset labels slightly outward and perpendicular to avoid overlap with dots
             var offsetDir = { x: Math.cos(a), y: Math.sin(a) };
             if (dVal !== null) {
                 var dPos = pt(i, scaleR(dVal) + 14);
@@ -1147,6 +1156,7 @@
             }
             if (nVal !== null) {
                 var nPos = pt(i, scaleR(nVal) + 14);
+                // If both values are close, offset the not-dagitan label to the side
                 var sameSpoke = dVal !== null && Math.abs(scaleR(dVal) - scaleR(nVal)) < 18;
                 var nx = nPos.x, ny = nPos.y;
                 if (sameSpoke) {
@@ -1178,33 +1188,44 @@
 
         svg.innerHTML = svgHTML;
 
-        // Bind hover/tap events
+        // Bind hover/tap events to dots
         var ttGroup = svg.getElementById('radar-tooltip');
         var ttBg    = svg.getElementById('radar-tt-bg');
         var ttName  = svg.getElementById('radar-tt-name');
         var ttLabel = svg.getElementById('radar-tt-label');
         var ttVal   = svg.getElementById('radar-tt-val');
 
-        function showRadarTooltip(dot) {
+        function showRadarTooltip(dot, svgRect) {
             ttName.textContent  = dot.name;
             ttLabel.textContent = dot.label;
             ttVal.textContent   = dot.val.toFixed(2);
             ttVal.setAttribute('fill', dot.color);
+
+            // Position tooltip so it stays inside viewBox (380x360)
             var ttW = 120, ttH = 44, margin = 8;
             var tx = dot.x - ttW / 2;
             var ty = dot.y - ttH - 12;
             if (tx < margin) tx = margin;
             if (tx + ttW > 380 - margin) tx = 380 - margin - ttW;
             if (ty < margin) ty = dot.y + 14;
-            ttBg.setAttribute('x', tx);    ttBg.setAttribute('y', ty);
-            ttBg.setAttribute('width', ttW); ttBg.setAttribute('height', ttH);
-            ttName.setAttribute('x', tx + ttW / 2);  ttName.setAttribute('y', ty + 14);
-            ttLabel.setAttribute('x', tx + ttW / 2); ttLabel.setAttribute('y', ty + 27);
-            ttVal.setAttribute('x', tx + ttW / 2);   ttVal.setAttribute('y', ty + 41);
+
+            ttBg.setAttribute('x', tx);
+            ttBg.setAttribute('y', ty);
+            ttBg.setAttribute('width', ttW);
+            ttBg.setAttribute('height', ttH);
+            ttName.setAttribute('x', tx + ttW / 2);
+            ttName.setAttribute('y', ty + 14);
+            ttLabel.setAttribute('x', tx + ttW / 2);
+            ttLabel.setAttribute('y', ty + 27);
+            ttVal.setAttribute('x', tx + ttW / 2);
+            ttVal.setAttribute('y', ty + 41);
+
             ttGroup.style.display = '';
         }
 
-        function hideRadarTooltip() { ttGroup.style.display = 'none'; }
+        function hideRadarTooltip() {
+            ttGroup.style.display = 'none';
+        }
 
         dotData.forEach(function(dot) {
             var el = svg.getElementById(dot.id);
