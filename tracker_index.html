@@ -1358,14 +1358,10 @@
 
         function loadData() {
             try {
-                const stored = localStorage.getItem('boardGameData');
-                if (stored) {
-                    games = JSON.parse(stored);
-                    // Validate data structure
-                    if (!Array.isArray(games)) {
-                        games = [];
-                    }
-                }
+                // Google Sheets is the source of truth. Do not restore historical games
+                // from this device; only retain an unfinished game as a recoverable draft.
+                games = [];
+                archivedSeasons = [];
                 const currentStored = localStorage.getItem('currentGame');
                 if (currentStored) {
                     currentGame = JSON.parse(currentStored);
@@ -1420,8 +1416,6 @@
                 }
                 const storedSeason = localStorage.getItem('currentSeason');
                 if (storedSeason) currentSeason = parseInt(storedSeason);
-                const storedArchived = localStorage.getItem('archivedSeasons');
-                if (storedArchived) archivedSeasons = JSON.parse(storedArchived);
                 updateSeasonDisplay();
             } catch (error) {
                 console.error('Error loading data:', error);
@@ -1432,17 +1426,20 @@
 
         function saveData() {
             try {
-                localStorage.setItem('boardGameData', JSON.stringify(games));
+                // Persist only the unfinished game draft and lightweight season hint.
+                // Completed games and archived history are reloaded from Google Sheets.
                 if (currentGame) {
                     localStorage.setItem('currentGame', JSON.stringify(currentGame));
                 } else {
                     localStorage.removeItem('currentGame');
                 }
                 localStorage.setItem('currentSeason', String(currentSeason));
-                localStorage.setItem('archivedSeasons', JSON.stringify(archivedSeasons));
+                // Remove legacy local history caches so they cannot become authoritative.
+                localStorage.removeItem('boardGameData');
+                localStorage.removeItem('archivedSeasons');
             } catch (error) {
-                console.error('Error saving data:', error);
-                alert('Error saving data. Please check your browser storage.');
+                console.error('Error saving draft/settings:', error);
+                alert('Error saving the unfinished game. Please check browser storage.');
             }
         }
 
@@ -1460,25 +1457,47 @@
             return url;
         }
 
+        function fetchWithTimeout(url, timeoutMs) {
+            var controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+            var timer;
+            var options = { cache: 'no-store' };
+            if (controller) options.signal = controller.signal;
+            var timeout = new Promise(function(_, reject) {
+                timer = setTimeout(function() {
+                    if (controller) controller.abort();
+                    reject(new Error('Request timed out after ' + Math.round(timeoutMs / 1000) + ' seconds.'));
+                }, timeoutMs);
+            });
+            return Promise.race([fetch(url, options), timeout]).then(function(response) {
+                clearTimeout(timer);
+                if (!response.ok) throw new Error('HTTP ' + response.status);
+                return response.text();
+            }).then(function(text) {
+                clearTimeout(timer);
+                return text;
+            }).catch(function(err) {
+                clearTimeout(timer);
+                throw err;
+            });
+        }
+
         function fetchSheetCsvText(url) {
             var baseUrl = normalizedSheetCsvUrl(url || sheetUrl);
-            var freshUrl = baseUrl + (baseUrl.indexOf('?') >= 0 ? '&' : '?') + '_=' + Date.now() + '_' + Math.random().toString(36).slice(2);
-            var corsProxy = 'https://corsproxy.io/?' + encodeURIComponent(freshUrl);
-            var allOriginsProxy = 'https://api.allorigins.win/raw?url=' + encodeURIComponent(freshUrl);
-            return fetch(freshUrl, { cache: 'no-store' })
-                .then(function(r) { if (!r.ok) throw new Error('Direct Sheet read returned HTTP ' + r.status); return r.text(); })
-                .catch(function() {
-                    return fetch(corsProxy, { cache: 'no-store' })
-                        .then(function(r) { if (!r.ok) throw new Error('CORS proxy returned HTTP ' + r.status); return r.text(); });
-                })
-                .catch(function() {
-                    return fetch(allOriginsProxy, { cache: 'no-store' })
-                        .then(function(r) { if (!r.ok) throw new Error('Backup Sheet reader returned HTTP ' + r.status); return r.text(); });
-                })
-                .then(function(csv) {
-                    if (!csv || csv.length < 10) throw new Error('Google Sheets returned an empty or incomplete CSV.');
-                    return csv;
+            var freshUrl = baseUrl + (baseUrl.indexOf('?') >= 0 ? '&' : '?') + '_=' + Date.now();
+            // Match the working Viewer app's read order: Sheet first, AllOrigins fallback.
+            return fetchWithTimeout(freshUrl, 10000).catch(function(directError) {
+                var proxyUrl = 'https://api.allorigins.win/raw?url=' + encodeURIComponent(freshUrl);
+                return fetchWithTimeout(proxyUrl, 12000).catch(function(proxyError) {
+                    throw new Error('Could not read Google Sheets. Direct request: ' + directError.message +
+                        ' AllOrigins fallback: ' + proxyError.message);
                 });
+            }).then(function(csv) {
+                if (!csv || csv.length < 10) throw new Error('Google Sheets returned an empty or incomplete CSV.');
+                if (/^\s*<!doctype html|^\s*<html/i.test(csv)) {
+                    throw new Error('The Sheet reader returned an HTML page instead of CSV. Check the published CSV URL and sharing settings.');
+                }
+                return csv;
+            });
         }
 
         function sheetContainsPayload(payload, csvText) {
@@ -1631,7 +1650,10 @@
             localStorage.setItem('googleSheetUrl', url);
             localStorage.setItem('appsScriptUrl', scriptUrl);
             
-            showSettingsStatus('✓ Settings saved! Auto-sync is now enabled.', 'success');
+            showSettingsStatus('Settings saved. Loading game history from Google Sheets...', 'success');
+            refreshStatsFromSheet({ silent: true }).catch(function(err) {
+                console.error('Initial Sheet load after settings save failed:', err);
+            });
         }
 
         function showSettingsStatus(message, type) {
@@ -1859,23 +1881,82 @@
             container.innerHTML = html;
         }
 
-        function refreshStatsFromSheet() {
+        function applySheetCsv(csvText, sourceLabel) {
+            var imported = parseCSVIntoGames(csvText);
+            if (!imported.length) {
+                throw new Error('The Sheet was reached, but no valid game rows were found. Existing tracker data was left unchanged.');
+            }
+
+            var maxSeason = Math.max(imported.maxSeason || 1, 1);
+            var newCurrentGames = imported.filter(function(g) { return Number(g.season || 1) === maxSeason; });
+            var newArchived = [];
+            var seasonNumbers = Array.from(new Set(imported.map(function(g) { return Number(g.season || 1); })))
+                .filter(function(n) { return n < maxSeason; }).sort(function(a, b) { return a - b; });
+
+            seasonNumbers.forEach(function(seasonNo) {
+                var seasonGames = imported.filter(function(g) { return Number(g.season || 1) === seasonNo; });
+                var win = seasonWinnerFromGames(seasonGames, seasonNo);
+                var lastGame = seasonGames.slice().sort(function(a, b) {
+                    return new Date(b.date) - new Date(a.date);
+                })[0];
+                newArchived.push({
+                    season: seasonNo,
+                    year: lastGame ? new Date(lastGame.date).getFullYear() : null,
+                    games: seasonGames,
+                    winner: win.winner,
+                    winnerScore: win.winnerScore
+                });
+            });
+
+            games = newCurrentGames;
+            archivedSeasons = newArchived;
+            currentSeason = maxSeason;
+            updateSeasonDisplay();
+
+            // The Sheet import succeeded; old local history is now safe to discard.
+            localStorage.removeItem('boardGameData');
+            localStorage.removeItem('archivedSeasons');
+            localStorage.setItem('currentSeason', String(currentSeason));
+
+            renderStats();
+            renderHistory();
+            renderImportHistory();
+
+            var label = document.getElementById('sheet-refresh-status');
+            if (label) label.textContent = 'Loaded ' + imported.length + ' game(s) across ' +
+                maxSeason + ' season(s) from Google Sheets (' + sourceLabel + ') at ' +
+                new Date().toLocaleTimeString() + '.';
+            return imported.length;
+        }
+
+        function refreshStatsFromSheet(options) {
+            options = options || {};
             if (!sheetUrl) {
-                alert('No Google Sheet URL configured. Go to Settings and add your sheet URL first.');
-                return;
+                var missing = 'No Google Sheet URL configured. Open Settings and add the published Sheet URL.';
+                if (!options.silent) alert(missing);
+                return Promise.reject(new Error(missing));
             }
-            if (currentGame) {
-                alert('Finish or end the active game before refreshing from Google Sheets.');
-                return;
-            }
-            if (!confirm('Refresh will replace this device’s current and archived game data with the rows found in Google Sheets. A local backup will be saved first. Continue only if the Sheet is the version you want to use.')) return;
             var btn = document.getElementById('refresh-sheet-btn');
             var label = document.getElementById('sheet-refresh-status');
-            if (btn) { btn.textContent = '⏳ Refreshing...'; btn.disabled = true; }
-            if (label) label.textContent = 'Fetching from Google Sheets...';
+            var originalText = btn ? btn.textContent : '';
+            if (btn) { btn.textContent = 'Refreshing...'; btn.disabled = true; }
+            if (label) label.textContent = 'Connecting to Google Sheets (each attempt has a timeout)...';
 
-            fetchSheetCsvText(sheetUrl).then(done)
-                .catch(fail);
+            return fetchSheetCsvText(sheetUrl).then(function(csvText) {
+                var count = applySheetCsv(csvText, 'live Sheet refresh');
+                if (!options.silent) {
+                    if (label) label.textContent = 'Refresh complete. ' + count + ' game(s) loaded from Google Sheets.';
+                }
+                return count;
+            }).catch(function(err) {
+                console.error('Google Sheets refresh failed:', err);
+                if (label) label.textContent = 'Refresh failed: ' + err.message +
+                    ' Your unfinished game draft and Sheet data were not changed.';
+                if (!options.silent) alert('Google Sheets refresh failed.\n\n' + err.message);
+                throw err;
+            }).finally(function() {
+                if (btn) { btn.textContent = originalText || '↻ Refresh Tracker from Google Sheets'; btn.disabled = false; }
+            });
         }
 
         function parseCSVIntoGames(csvText) {
@@ -3562,6 +3643,20 @@
         }
 
         loadData();
+
+        // Automatically hydrate completed-game history from the Sheet on launch.
+        // The in-progress game, if any, remains a local draft and is not overwritten.
+        if (sheetUrl) {
+            refreshStatsFromSheet({ silent: true }).catch(function() {
+                renderStats();
+                renderHistory();
+            });
+        } else {
+            var refreshLabel = document.getElementById('sheet-refresh-status');
+            if (refreshLabel) refreshLabel.textContent = 'Add the published Google Sheet URL in Settings to load the authoritative game history.';
+            renderStats();
+            renderHistory();
+        }
 
         var tpChartInstance = null;
 
